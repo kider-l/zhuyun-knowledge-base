@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(& \"d:\\\\����\\\\zhuyun-knowledge-base-main\\\\backend\\\\.venv-win\\\\Scripts\\\\python.exe\" -c \"import fastapi; print\\('fastapi ok'\\)\" 2>$null)",
+      "PowerShell(& \"d:\\\\����\\\\zhuyun-knowledge-base-main\\\\backend\\\\.venv-win\\\\Scripts\\\\python.exe\" -c \"import uvicorn; print\\('uvicorn ok'\\)\" 2>$null)",
+      "PowerShell(& \"d:\\\\����\\\\zhuyun-knowledge-base-main\\\\backend\\\\.venv-win\\\\Scripts\\\\python.exe\" -c \"import sqlalchemy; print\\('sqlalchemy ok'\\)\" 2>$null)",
+      "PowerShell(& \"d:\\\\����\\\\zhuyun-knowledge-base-main\\\\backend\\\\.venv-win\\\\Scripts\\\\python.exe\" -c \"import httpx; print\\('httpx ok'\\)\" 2>$null)",
+      "PowerShell(Start-Process powershell -Verb RunAs -ArgumentList '-NoExit', '-Command', 'wsl --install; Write-Host \"`nWSL 安装完成，请重启电脑。\"; Read-Host \"按回车退出\"' -Wait)",
+      "PowerShell(winget install Docker.DockerDesktop --accept-source-agreements 2>&1)",
+      "PowerShell(docker info 2>$null)",
+      "PowerShell(python --version)",
+      "PowerShell(& \"D:\\\\python\\\\python.exe\" --version 2>$null)",
+      "PowerShell(python d:\\\\����\\\\zhuyun-knowledge-base-main\\\\test_review.py)",
+      "PowerShell(curl.exe -s -X POST http://localhost:8000/api/search -H \"Content-Type: application/json\" -d \"@$env:TEMP\\\\search.json\" -o \"$env:TEMP\\\\search_result.json\"; Get-Content \"$env:TEMP\\\\search_result.json\" -TotalCount 500)",
+      "PowerShell(curl.exe -s -o nul -w \"%{http_code} %{content_type} %{size_download}bytes\" http://localhost:8000/api/assets/8a097972-4937-4d9a-b54c-37a8f7c6ddd9)"
+    ]
+  }
+}
