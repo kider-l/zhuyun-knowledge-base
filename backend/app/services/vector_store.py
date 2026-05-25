@@ -22,7 +22,7 @@ TEXT_COLLECTION = "text_chunks"
 IMAGE_COLLECTION = "image_chunks"
 IMAGE_TEXT_COLLECTION = "image_text_chunks"
 
-IMAGE_INTENT_TERMS = ["图", "图纸", "疏散", "路线", "平面", "示意", "地图", "现场", "出口", "区域"]
+IMAGE_INTENT_TERMS = ["图", "图纸", "疏散", "路线", "平面", "示意", "地图", "现场", "出口", "区域", "线路", "配电", "接线", "电路", "电气", "物资", "存放点"]
 
 # 纸张资料关键词 — 用于识别笔录、登记表、扫描件等非场景照片
 PAPER_RECORD_KEYWORDS = [
@@ -105,7 +105,7 @@ def _image_keyword_boost(content: str, asset_kind: str, mode: str, image_intent:
             boost += 0.06
         elif asset_kind == "page":
             boost += 0.03
-    if image_intent and any(term in content for term in ["疏散", "路线", "平面", "出口", "现场", "图", "图纸", "区域"]):
+    if image_intent and any(term in content for term in ["疏散", "路线", "平面", "出口", "现场", "图", "图纸", "区域", "线路", "配电", "接线", "电路", "电气", "物资", "存放点"]):
         boost += 0.08
     return boost
 
@@ -116,7 +116,7 @@ def _candidate_limit(top_k: int, base_multiplier: int, hard_limit: int) -> int:
 
 def _process_image_ratio(query: str, default_ratio: float) -> float:
     if _is_image_intent(query):
-        return 0.75
+        return 0.88
     return max(default_ratio, 0.45)
 
 
@@ -817,12 +817,20 @@ class VectorStore:
         elif mode == "text":
             chunks = chunks[: _candidate_limit(top_k, 4, self.settings.reranker_max_candidates)]
 
-        if mode == "process":
+        if mode == "process" or (mode == "all" and image_intent):
             image_ratio = _process_image_ratio(query, self.settings.process_image_reserve_ratio)
             image_slots = min(len(image_chunks), max(1, int(math.ceil(top_k * image_ratio))))
             text_slots = max(0, top_k - image_slots)
             ordered_text_chunks = [chunk for chunk in chunks if chunk.kind == "text"]
             ordered_image_chunks = [chunk for chunk in chunks if chunk.kind == "image"]
+            # 优先保证精准切图（figure_region等）入选，再以全页截图补位
+            PRECISE_PRIORITY = {"figure_region": 0, "embedded_image": 1, "figure": 2, "table": 3, "whole_figure_fallback": 4, "page": 5}
+            ordered_image_chunks.sort(
+                key=lambda c: (
+                    PRECISE_PRIORITY.get(str((c.chunk_metadata or {}).get("asset_kind", "")), 9),
+                    -(vector_score_map.get(c.id, 0.0) + keyword_score_map.get(c.id, 0.0)),
+                ),
+            )
             selected = ordered_text_chunks[:text_slots] + ordered_image_chunks[:image_slots]
             if len(selected) < top_k:
                 selected_ids = {chunk.id for chunk in selected}
@@ -833,7 +841,8 @@ class VectorStore:
                     if len(selected) >= top_k:
                         break
             chunks = selected
-            self.last_search_diagnostics["fusion_strategy"] = f"process_dual_channel_reserve_{int(image_ratio * 100)}pct_images"
+            strategy_label = "image_intent_dual_channel" if mode == "all" else "process_dual_channel"
+            self.last_search_diagnostics["fusion_strategy"] = f"{strategy_label}_reserve_{int(image_ratio * 100)}pct_images"
         elif mode == "images":
             chunks = chunks[: _candidate_limit(top_k, 8, max(self.settings.reranker_max_candidates, top_k * 8))]
             self.last_search_diagnostics["fusion_strategy"] = "image_hybrid_fusion"
@@ -854,9 +863,7 @@ class VectorStore:
                 continue
             if kind in {"text", "image"} and chunk.kind != kind:
                 continue
-            # 搜索层面屏蔽 SCENE_IMAGE（实景场景图），仅召回 DOC_IMAGE 业务资料图
-            if chunk.kind == "image" and (chunk.chunk_metadata or {}).get("image_class") == "SCENE_IMAGE":
-                continue
+            # SCENE_IMAGE 与 DOC_IMAGE 均保留，前端按 image_class 分组展示
             vector_score = vector_score_map.get(chunk.id, 0.0)
             lexical = lexical_score_map.get(chunk.id, 0.0)
             keyword_score_value = keyword_score_map.get(chunk.id, 0.0)
@@ -870,8 +877,12 @@ class VectorStore:
             elif mode == "process":
                 score = vector_score * 0.58 + keyword_score_value * 0.42 + asset_priority * 0.6
             else:
-                score = vector_score * 0.72 + keyword_score_value * 0.28 + asset_priority * 0.25
+                image_boost_coeff = 0.45 if image_intent else 0.25
+                score = vector_score * 0.72 + keyword_score_value * 0.28 + asset_priority * image_boost_coeff
             asset = assets.get(chunk.asset_id) if chunk.asset_id else None
+            # 切图文件缺失时回退到页面级截图
+            if asset and not Path(asset.path).exists():
+                asset = None
             page_asset = page_assets.get((chunk.document_id, chunk.page_number))
             preview_asset = asset or page_asset
             boxes, highlight_precision = _highlight_boxes(doc, chunk, preview_asset, query)
@@ -911,6 +922,49 @@ class VectorStore:
                 )
             )
         ranked_results = sorted(results, key=lambda item: item.score, reverse=True)
+        # 图片去重策略
+        # - figure_region / embedded_image：精准切图，同一页不同区域各自保留
+        # - page / whole_figure_fallback：全页级别，同一页只保留最佳一个
+        # - 查询含图片意图时，优先展示切图，过滤纯文字页截图
+        ASSET_PRIORITY = {"page": 0, "whole_figure_fallback": 1, "figure": 2, "table": 3, "embedded_image": 4, "figure_region": 5}
+        PRECISE_CROP_TYPES = {"figure_region", "embedded_image", "figure", "table"}
+        deduped: list[SearchResult] = []
+        best_per_page: dict[tuple[str, int], SearchResult] = {}
+        kept_regions: set[tuple[str, int, str]] = set()
+        for r in ranked_results:
+            if r.kind == "image":
+                asset_kind = str(r.metadata.get("asset_kind", ""))
+                # 精准切图：按 (文档, 页码, 资产ID) 去重，同一页多张图各自保留
+                if asset_kind in PRECISE_CROP_TYPES:
+                    region_key = (r.document_id, r.page_number, r.asset_id or "")
+                    if region_key not in kept_regions:
+                        kept_regions.add(region_key)
+                        deduped.append(r)
+                else:
+                    # 全页级图片：同一页只保留最佳
+                    key = (r.document_id, r.page_number)
+                    existing = best_per_page.get(key)
+                    if existing:
+                        existing_pri = ASSET_PRIORITY.get(str(existing.metadata.get("asset_kind", "")), 0)
+                        current_pri = ASSET_PRIORITY.get(asset_kind, 0)
+                        if current_pri > existing_pri or (current_pri == existing_pri and r.score > existing.score):
+                            best_per_page[key] = r
+                    else:
+                        best_per_page[key] = r
+            else:
+                deduped.append(r)
+        # 图片意图查询：如果已有足够精准切图，去掉全页级截图避免干扰
+        if image_intent:
+            precise_count = sum(1 for r in deduped if str(r.metadata.get("asset_kind", "")) in PRECISE_CROP_TYPES)
+            if precise_count >= 2:
+                best_per_page = {
+                    k: v for k, v in best_per_page.items()
+                    if v.metadata.get("image_class") != "SCENE_IMAGE"
+                }
+            deduped = deduped + sorted(best_per_page.values(), key=lambda r: r.score, reverse=True)
+        else:
+            deduped = deduped + sorted(best_per_page.values(), key=lambda r: r.score, reverse=True)
+        ranked_results = deduped
         image_result_type_breakdown: dict[str, int] = {}
         for result in ranked_results[:top_k]:
             asset_kind = str(result.metadata.get("asset_kind") or result.kind)

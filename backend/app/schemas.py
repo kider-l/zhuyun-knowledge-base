@@ -1,7 +1,17 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
+
+
+class UTCModel(BaseModel):
+    """基类：JSON 序列化时给无时区的 datetime 自动加上 Z（UTC）标记。"""
+    @field_serializer("*", when_used="json")
+    @classmethod
+    def _add_utc_flag(cls, value: object) -> object:
+        if isinstance(value, datetime) and value.tzinfo is None:
+            return value.isoformat() + "Z"
+        return value
 
 
 class LoginRequest(BaseModel):
@@ -14,7 +24,7 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
-class DocumentOut(BaseModel):
+class DocumentOut(UTCModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
@@ -29,7 +39,7 @@ class DocumentOut(BaseModel):
     updated_at: datetime
 
 
-class JobOut(BaseModel):
+class JobOut(UTCModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
@@ -153,7 +163,7 @@ class ChunkUpdateRequest(BaseModel):
     approved: bool | None = None
 
 
-class DuplicateDocumentInfo(BaseModel):
+class DuplicateDocumentInfo(UTCModel):
     document_id: str
     filename: str
     sha256: str
@@ -174,7 +184,7 @@ class UploadBatchResponse(BaseModel):
     items: list[UploadBatchItem]
 
 
-class UploadLogOut(BaseModel):
+class UploadLogOut(UTCModel):
     id: str
     filename: str
     sha256: str

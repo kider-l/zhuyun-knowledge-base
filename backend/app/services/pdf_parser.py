@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 from datetime import datetime
 from pathlib import Path
 import re
@@ -142,12 +143,20 @@ def _build_image_chunk_content(
     ocr_text: str = "",
     region_summary_text: str = "",
     page_context: str = "",
+    core_topic: str = "",
+    image_keywords: list[str] | None = None,
 ) -> str:
     parts = [
         f"文件：{filename}",
         f"页码：{page_number}",
         f"资源类型：{asset_kind}",
     ]
+    if core_topic:
+        parts.append(f"主题：{core_topic}")
+    if image_keywords:
+        kw_str = " ".join(image_keywords[:10])
+        if kw_str:
+            parts.append(f"关键词：{kw_str}")
     if caption:
         parts.append(f"图题：{caption}")
     if region_summary_text:
@@ -259,16 +268,19 @@ def _create_legacy_embedded_image_chunk(
         meta["core_topic"] = image_classification.get("core_topic", "")
         meta["image_keywords"] = image_classification.get("image_keywords", [])
         meta["usable_for_qa"] = image_classification.get("usable_for_qa", True)
-    content = normalize_text(
-        "\n".join(
-            [
-                f"文件：{document.filename}",
-                f"第 {page_number} 页嵌入图片",
-                f"图片标题：{caption or '未识别标题'}",
-                full_text[:1000] or "图片上下文暂缺，可能需要 OCR。",
-            ]
-        )
-    )
+    core_topic = str(image_classification.get("core_topic", "")) if image_classification else ""
+    image_keywords: list[str] = list(image_classification.get("image_keywords", [])) if image_classification else []
+    content_parts = [
+        f"文件：{document.filename}",
+        f"第 {page_number} 页嵌入图片",
+        f"图片标题：{caption or '未识别标题'}",
+    ]
+    if core_topic:
+        content_parts.append(f"主题：{core_topic}")
+    if image_keywords:
+        content_parts.append(f"关键词：{' '.join(image_keywords[:10])}")
+    content_parts.append(full_text[:1000] or "图片上下文暂缺，可能需要 OCR。")
+    content = normalize_text("\n".join(content_parts))
     db.add(
         Chunk(
             document_id=document.id,
@@ -343,7 +355,7 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
             captions = extract_captions(page_text)
             title_path = infer_title_path(page_text)
 
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
             page_asset_path = assets_path / f"page_{page_number:04d}.png"
             pix.save(str(page_asset_path))
             page_asset = Asset(
@@ -365,7 +377,8 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
             ocr_meta: dict = {}
             ocr_lines: list[dict] = []
             needs_page_ocr = len(page_text) < 40
-            if needs_page_ocr:
+            ocr_page_count = stats.get("ocr_pages", 0) + stats.get("needs_ocr_pages", 0)
+            if needs_page_ocr and ocr_page_count < ocr.settings.cloud_ocr_max_pages:
                 ocr_result = ocr.recognize(page_asset_path)
                 ocr_text = ocr_result["text"]
                 ocr_meta = ocr_result["meta"]
@@ -418,6 +431,8 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
                     stats=stats,
                 )
 
+            all_layout_regions = layout.detect_regions(page_asset_path)
+
             table_candidates: list[tuple[dict[str, float], str]] = []
             try:
                 detected_tables = list(getattr(page.find_tables(), "tables", []))
@@ -438,15 +453,16 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
                 )
 
             if not table_candidates:
-                for table_region in layout.detect_table_regions(page_asset_path):
-                    table_candidates.append((_layout_region_to_absolute_bbox(page.rect, table_region), table_region.source))
+                for table_region in all_layout_regions:
+                    if table_region.label == "table":
+                        table_candidates.append((_layout_region_to_absolute_bbox(page.rect, table_region), table_region.source))
 
             for table_index, (bbox, source_name) in enumerate(table_candidates):
                 rect = fitz.Rect(bbox["x0"], bbox["y0"], bbox["x1"], bbox["y1"])
                 if rect.width < 40 or rect.height < 30:
                     continue
                 table_path = assets_path / f"page_{page_number:04d}_table_{table_index:02d}.png"
-                table_pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect, alpha=False)
+                table_pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), clip=rect, alpha=False)
                 table_pix.save(str(table_path))
                 extracted_table_text = ""
                 if source_name == "pymupdf":
@@ -521,8 +537,9 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
                 stats["table_chunks"] += 1
                 stats["image_chunks"] += 1
 
-            figure_regions = [region for region in layout.detect_regions(page_asset_path) if region.label == "figure"]
+            figure_regions = [region for region in all_layout_regions if region.label == "figure"]
             image_count_on_page = 0
+            embed_assets: list[tuple[Asset, str | None]] = []
             for block_index, block in enumerate(image_blocks):
                 bbox = block.get("bbox")
                 if not bbox or len(bbox) < 4:
@@ -561,14 +578,36 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
                 db.add(asset)
                 db.flush()
                 stats["embedded_images"] += 1
+                embed_assets.append((asset, caption))
                 image_count_on_page += 1
-                img_class = vision_summary.classify_image(
-                    image_path,
-                    asset_kind="embedded_image",
-                    caption=caption or "",
-                    page_text=full_text,
-                    chapter_info=title_path or "",
-                )
+
+            # Classify all embedded images in parallel
+            embed_classify_results: list[dict | None] = [None] * len(embed_assets)
+            if embed_assets:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                    fut_to_idx: dict[concurrent.futures.Future, int] = {}
+                    for idx, (asset, caption) in enumerate(embed_assets):
+                        fut = executor.submit(
+                            vision_summary.classify_image,
+                            str(Path(asset.path)),
+                            asset_kind="embedded_image",
+                            caption=caption or "",
+                            page_text=full_text,
+                            chapter_info=title_path or "",
+                        )
+                        fut_to_idx[fut] = idx
+                    for future in concurrent.futures.as_completed(fut_to_idx):
+                        idx = fut_to_idx[future]
+                        try:
+                            embed_classify_results[idx] = future.result()
+                        except Exception:
+                            embed_classify_results[idx] = None
+
+            # Create legacy chunks sequentially
+            for idx, (asset, caption) in enumerate(embed_assets):
+                img_class = embed_classify_results[idx]
+                if img_class is None:
+                    img_class = {"image_class": "DOC_IMAGE", "class_confidence": 0.5, "core_topic": caption or "", "image_keywords": [], "usable_for_qa": True}
                 _create_legacy_embedded_image_chunk(
                     db=db,
                     document=document,
@@ -592,9 +631,19 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
                 "split_region_counts": [],
                 "whole_figure_fallbacks": 0,
             }
+            # Phase 1: Build all region task info (sequential I/O: crop + DB flush)
+            page_region_tasks: list[dict] = []
             for figure_index, figure_region in enumerate(figure_regions):
                 figure_path = assets_path / f"page_{page_number:04d}_figure_{figure_index:02d}.png"
-                crop_normalized_bbox(page_asset_path, figure_region.bbox, figure_path)
+                fig_size = crop_normalized_bbox(page_asset_path, figure_region.bbox, figure_path)
+                # 跳过空/极小的切图（布局检测误报），避免前端显示白图
+                # 空白区域 PNG 压缩后极小，即使像素尺寸很大
+                fig_w, fig_h = fig_size
+                if fig_w < 60 or fig_h < 60 or figure_path.stat().st_size < 500:
+                    stats.setdefault("skipped_tiny_figures", 0)
+                    stats["skipped_tiny_figures"] += 1
+                    figure_path.unlink(missing_ok=True)
+                    continue
                 figure_bbox = _layout_region_to_absolute_bbox(page.rect, figure_region)
                 figure_asset = Asset(
                     document_id=document.id,
@@ -622,89 +671,157 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
 
                 for region_index, split_region in enumerate(split_regions):
                     region_path = assets_path / f"page_{page_number:04d}_figure_{figure_index:02d}_region_{region_index:02d}.png"
-                    crop_normalized_bbox(figure_path, split_region.bbox, region_path)
+                    region_size = crop_normalized_bbox(figure_path, split_region.bbox, region_path)
+                    # 跳过过小的区域切图（避免白图）
+                    if region_size[0] < 20 or region_size[1] < 20:
+                        stats.setdefault("skipped_tiny_regions", 0)
+                        stats["skipped_tiny_regions"] += 1
+                        continue
                     region_bbox_normalized = compose_bbox(figure_region.bbox, split_region.bbox)
                     region_bbox = _normalized_bbox_to_page_dict(page.rect, region_bbox_normalized)
-                    region_ocr = ocr.recognize_region(region_path)
-                    region_ocr_text = region_ocr["text"].strip()
-                    figure_summary = vision_summary.summarize_figure_region(
-                        region_path,
-                        extracted_text=region_ocr_text,
-                        context_text=full_text,
-                    )
-                    region_summary_text = vision_summary.region_summary_text(figure_summary)
+                    page_region_tasks.append({
+                        "figure_index": figure_index,
+                        "region_index": region_index,
+                        "figure_asset": figure_asset,
+                        "region_path": region_path,
+                        "region_bbox": region_bbox,
+                        "split_region": split_region,
+                        "figure_region_source": figure_region.source,
+                    })
+
+            # Phase 2: Run VLM calls for all regions in parallel
+            def _vlm_region(t: dict) -> dict:
+                # Embedded images: skip VLM (already classified in legacy path)
+                if t.get("figure_region_source") == "embedded_image":
+                    return {
+                        "ocr": {"text": "", "meta": {"backend": "skip", "available": False, "has_line_boxes": False}, "lines": []},
+                        "ocr_text": "",
+                        "summary": {},
+                        "summary_text": "",
+                        "classification": {"image_class": "DOC_IMAGE", "class_confidence": 0.5, "core_topic": "", "image_keywords": [], "usable_for_qa": True},
+                    }
+                # Regular regions: combine OCR into summarization (saves 1 API call)
+                r_summary = vision_summary.summarize_figure_region(
+                    t["region_path"],
+                    extracted_text="",
+                    context_text=full_text,
+                    extract_ocr=True,
+                )
+                r_ocr_text = str(r_summary.get("ocr_text", "")).strip()
+                r_summary_text = vision_summary.region_summary_text(r_summary)
+                r_img_class = vision_summary.classify_image(
+                    t["region_path"],
+                    asset_kind="figure_region",
+                    caption=(captions[min(t["figure_index"], len(captions) - 1)] if captions else ""),
+                    page_text=full_text,
+                    chapter_info=title_path or "",
+                )
+                return {
+                    "ocr": {"text": r_ocr_text, "meta": {"backend": "combined_vlm", "available": bool(r_ocr_text), "has_line_boxes": False}, "lines": []},
+                    "ocr_text": r_ocr_text,
+                    "summary": r_summary,
+                    "summary_text": r_summary_text,
+                    "classification": r_img_class,
+                }
+
+            vlm_results_list: list[dict | None] = [None] * len(page_region_tasks)
+            if page_region_tasks:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                    fut_to_idx = {executor.submit(_vlm_region, t): i for i, t in enumerate(page_region_tasks)}
+                    for future in concurrent.futures.as_completed(fut_to_idx):
+                        idx = fut_to_idx[future]
+                        try:
+                            vlm_results_list[idx] = future.result()
+                        except Exception as exc:
+                            import warnings
+                            warnings.warn(f"[pdf_parser] VLM task failed for page {page_number} region {idx}: {exc}")
+                            vlm_results_list[idx] = None
+
+            # Phase 3: Create DB objects sequentially (preserve order)
+            for task_index, (task, vlm_result) in enumerate(zip(page_region_tasks, vlm_results_list)):
+                region_path = task["region_path"]
+                region_bbox = task["region_bbox"]
+                figure_asset = task["figure_asset"]
+                region_index = task["region_index"]
+                split_region = task["split_region"]
+
+                region_ocr_text = ""
+                region_summary_text = ""
+                figure_summary = {}
+                region_img_class = {"image_class": "DOC_IMAGE", "class_confidence": 0.5, "core_topic": "", "image_keywords": [], "usable_for_qa": True}
+                if vlm_result is not None:
+                    region_ocr_text = vlm_result["ocr_text"]
+                    figure_summary = vlm_result["summary"]
+                    region_summary_text = vlm_result["summary_text"]
+                    region_img_class = vlm_result["classification"]
                     if region_summary_text:
                         stats["vision_summaries"] += 1
-                    region_asset = figure_asset
-                    if split_region.source != "whole_figure" or region_index > 0:
-                        region_asset = Asset(
-                            document_id=document.id,
-                            page_number=page_number,
-                            kind="image",
-                            path=str(region_path),
-                            mime_type="image/png",
-                            bbox=region_bbox,
-                            parent_asset_id=figure_asset.id,
-                            region_index=region_index,
-                            region_type="figure_region",
-                            region_summary=region_summary_text[:1000] if region_summary_text else None,
-                            caption=figure_asset.caption,
-                            ocr_text=region_ocr_text or None,
-                        )
-                        db.add(region_asset)
-                        db.flush()
-                    else:
-                        region_asset.region_type = "whole_figure_fallback"
-                        region_asset.region_summary = region_summary_text[:1000] if region_summary_text else None
-                        region_asset.ocr_text = region_ocr_text or None
 
-                    region_img_class = vision_summary.classify_image(
-                        region_path,
-                        asset_kind=region_asset.region_type or "image",
-                        caption=region_asset.caption or "",
-                        page_text=full_text,
-                        chapter_info=title_path or "",
+                region_asset = figure_asset
+                if split_region.source != "whole_figure" or region_index > 0:
+                    region_asset = Asset(
+                        document_id=document.id,
+                        page_number=page_number,
+                        kind="image",
+                        path=str(region_path),
+                        mime_type="image/png",
+                        bbox=region_bbox,
+                        parent_asset_id=figure_asset.id,
+                        region_index=region_index,
+                        region_type="figure_region",
+                        region_summary=region_summary_text[:1000] if region_summary_text else None,
+                        caption=figure_asset.caption,
+                        ocr_text=region_ocr_text or None,
                     )
-                    db.add(
-                        Chunk(
-                            document_id=document.id,
-                            asset_id=region_asset.id,
+                    db.add(region_asset)
+                    db.flush()
+                else:
+                    region_asset.region_type = "whole_figure_fallback"
+                    region_asset.region_summary = region_summary_text[:1000] if region_summary_text else None
+                    region_asset.ocr_text = region_ocr_text or None
+
+                db.add(
+                    Chunk(
+                        document_id=document.id,
+                        asset_id=region_asset.id,
+                        page_number=page_number,
+                        kind="image",
+                        content=_build_image_chunk_content(
+                            filename=document.filename,
                             page_number=page_number,
-                            kind="image",
-                            content=_build_image_chunk_content(
-                                filename=document.filename,
-                                page_number=page_number,
-                                asset_kind=region_asset.region_type or "image",
-                                caption=region_asset.caption or "",
-                                ocr_text=region_ocr_text,
-                                region_summary_text=region_summary_text,
-                                page_context=full_text,
-                            ),
-                            title_path=title_path,
-                            bbox=region_bbox,
-                            chunk_metadata={
-                                "asset_kind": region_asset.region_type or "image",
-                                "image_class": region_img_class.get("image_class", "DOC_IMAGE"),
-                                "class_confidence": region_img_class.get("class_confidence", 0.5),
-                                "core_topic": region_img_class.get("core_topic", ""),
-                                "image_keywords": region_img_class.get("image_keywords", []),
-                                "usable_for_qa": region_img_class.get("usable_for_qa", True),
-                                "layout_source": figure_region.source,
-                                "parent_asset_id": figure_asset.id if region_asset.id != figure_asset.id else None,
-                                "region_index": region_index,
-                                "caption": region_asset.caption,
-                                "needs_ocr": not bool(region_ocr_text),
-                                "ocr": region_ocr["meta"],
-                                "ocr_lines": _ocr_lines_for_chunk(region_ocr_text, region_ocr["lines"], limit=12) if region_ocr["lines"] else [],
-                                "region_summary": figure_summary,
-                                "region_summary_text": region_summary_text,
-                                "visible_labels": figure_summary.get("visible_labels", []),
-                                "key_symbols": figure_summary.get("key_symbols", []),
-                                "exits_or_destinations": figure_summary.get("exits_or_destinations", []),
-                            },
-                        )
+                            asset_kind=region_asset.region_type or "image",
+                            caption=figure_asset.caption or "",
+                            ocr_text=region_ocr_text,
+                            region_summary_text=region_summary_text,
+                            page_context=full_text,
+                            core_topic=region_img_class.get("core_topic", ""),
+                            image_keywords=region_img_class.get("image_keywords", []),
+                        ),
+                        title_path=title_path,
+                        bbox=region_bbox,
+                        chunk_metadata={
+                            "asset_kind": region_asset.region_type or "image",
+                            "image_class": region_img_class.get("image_class", "DOC_IMAGE"),
+                            "class_confidence": region_img_class.get("class_confidence", 0.5),
+                            "core_topic": region_img_class.get("core_topic", ""),
+                            "image_keywords": region_img_class.get("image_keywords", []),
+                            "usable_for_qa": region_img_class.get("usable_for_qa", True),
+                            "layout_source": task["figure_region_source"],
+                            "parent_asset_id": figure_asset.id if region_asset.id != figure_asset.id else None,
+                            "region_index": region_index,
+                            "caption": figure_asset.caption,
+                            "needs_ocr": not bool(region_ocr_text),
+                            "ocr": (vlm_result["ocr"]["meta"] if vlm_result and vlm_result.get("ocr") else {}),
+                            "ocr_lines": _ocr_lines_for_chunk(region_ocr_text, (vlm_result["ocr"]["lines"] if vlm_result and vlm_result.get("ocr") else []), limit=12) if region_ocr_text else [],
+                            "region_summary": figure_summary,
+                            "region_summary_text": region_summary_text,
+                            "visible_labels": figure_summary.get("visible_labels", []),
+                            "key_symbols": figure_summary.get("key_symbols", []),
+                            "exits_or_destinations": figure_summary.get("exits_or_destinations", []),
+                        },
                     )
-                    stats["image_chunks"] += 1
+                )
+                stats["image_chunks"] += 1
             if figure_regions:
                 stats["figure_region_diagnostics"].append(page_figure_diagnostics)
 

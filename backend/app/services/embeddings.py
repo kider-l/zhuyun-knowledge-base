@@ -32,16 +32,23 @@ class EmbeddingService:
         self.settings = get_settings()
         self.dim = self.settings.embedding_dim
 
-    def embed(self, text: str) -> list[float]:
+    def embed(self, text: str, target_dim: int | None = None) -> list[float]:
         text = text.strip() or "blank"
         try:
             if self.settings.model_provider == "openai_compatible":
-                return self._embed_openai_compatible(text)
-            if self.settings.model_provider == "none":
-                return hash_embedding(text, self.dim)
-            return self._embed_ollama(text)
+                vector = self._embed_openai_compatible(text)
+            elif self.settings.model_provider == "none":
+                vector = hash_embedding(text, self.dim)
+            else:
+                vector = self._embed_ollama(text)
         except Exception:
-            return hash_embedding(text, self.dim)
+            vector = hash_embedding(text, self.dim)
+        target = target_dim or self.dim
+        if len(vector) > target:
+            vector = vector[:target]
+        elif len(vector) < target and not target_dim:
+            self.dim = len(vector)
+        return normalize_vector(vector)
 
     @property
     def active_model_name(self) -> str:
@@ -84,8 +91,9 @@ class EmbeddingService:
                 if self.settings.image_embedding_provider == "dashscope":
                     return self._embed_dashscope_multimodal({"text": text})
                 return self._embed_jina_multimodal(text)
-        except Exception:
-            pass
+        except Exception as exc:
+            import warnings
+            warnings.warn(f"[Embedding] image query embedding API failed: {exc}")
         return hash_embedding(text, self.dim)
 
     def embed_image_file(self, image_path: str | Path, fallback_text: str = "") -> list[float]:
@@ -97,8 +105,9 @@ class EmbeddingService:
                     mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
                     return self._embed_dashscope_multimodal({"image": f"data:{mime_type};base64,{encoded}"})
                 return self._embed_jina_multimodal({"bytes": encoded})
-        except Exception:
-            pass
+        except Exception as exc:
+            import warnings
+            warnings.warn(f"[Embedding] image embedding API failed for {image_path}: {exc}")
         return hash_embedding(fallback_text or str(image_path), self.dim)
 
     def _embed_ollama(self, text: str) -> list[float]:
@@ -120,8 +129,6 @@ class EmbeddingService:
                 vector = embeddings[0] if embeddings else data.get("embedding")
             if not vector:
                 raise RuntimeError("empty embedding from Ollama")
-            if len(vector) != self.dim:
-                self.dim = len(vector)
             return normalize_vector([float(item) for item in vector])
 
     def _embed_jina_multimodal(self, item: str | dict[str, str]) -> list[float]:
@@ -191,8 +198,6 @@ class EmbeddingService:
             vector = data.get("data", [{}])[0].get("embedding")
             if not vector:
                 raise RuntimeError("empty embedding from cloud API")
-            if len(vector) != self.dim:
-                self.dim = len(vector)
             return normalize_vector([float(item) for item in vector])
 
 

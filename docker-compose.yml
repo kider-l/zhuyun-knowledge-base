@@ -88,6 +88,7 @@ services:
       retries: 3
     environment:
       - RERANKER_DEVICE=cpu
+      - HF_ENDPOINT=https://hf-mirror.com
 
   frontend:
     build:

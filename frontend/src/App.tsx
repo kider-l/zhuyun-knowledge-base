@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+﻿import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUp,
   BookOpen,
@@ -164,7 +164,9 @@ function formatSize(size: number): string {
 
 function formatTime(value?: string | null): string {
   if (!value) return "-";
-  const date = new Date(value);
+  // 无时区标记时视为 UTC 时间，避免被 JS 误解析为本地时间
+  const normalized = /(Z|[+-]\d{2}:?\d{2})$/.test(value) ? value : value + "Z";
+  const date = new Date(normalized);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN");
 }
 
@@ -245,26 +247,19 @@ function citationIndexes(answer: string, max: number): number[] {
   return indexes;
 }
 
-function displayableResults(response: AnswerResponse): Array<{ result: SearchResult; index: number }> {
+function displayableResults(response: AnswerResponse): Array<{ result: SearchResult; index: number; cited: boolean }> {
   const allResults = response.results
     .map((result, index) => ({ result, index }))
     .filter((item) => {
       if (item.result.kind !== "image" || !item.result.asset_url) return false;
       const meta = item.result.metadata as Record<string, unknown>;
-      const imageClass = String(meta?.image_class || "");
-      // image_class 分类过滤：只展示 DOC_IMAGE 业务资料图，排除 SCENE_IMAGE
-      if (imageClass === "SCENE_IMAGE") return false;
-      // 兼容旧文档（无 image_class）：沿用 paper_record 检测
+      const imageClass = String(meta?.image_class || "DOC_IMAGE");
       if (!imageClass && meta?.paper_record === true) return false;
-      // 只保留真正视觉内容类型
       const assetKind = String(meta?.asset_kind || "");
-      if (assetKind === "page") return false;
-      return ["embedded_image", "figure", "figure_region", "whole_figure_fallback", "table"].includes(assetKind);
+      return ["page", "embedded_image", "figure", "figure_region", "whole_figure_fallback", "table"].includes(assetKind);
     });
   const cited = citationIndexes(response.answer, response.results.length);
-  const citedResults = cited
-    .map((index) => allResults.find((item) => item.index === index))
-    .filter((item): item is { result: SearchResult; index: number } => Boolean(item));
+  const citedSet = new Set(cited);
 
   function sourceKey(item: { result: SearchResult }): string {
     return item.result.asset_url || item.result.chunk_id;
@@ -272,12 +267,18 @@ function displayableResults(response: AnswerResponse): Array<{ result: SearchRes
 
   const seen = new Set<string>();
   const seenOverlapPage = new Set<string>();
-  const merged = [...citedResults, ...allResults].filter((item) => {
+  // 去重前把被引用的排前面，确保被引用的优先保留
+  const merged = allResults
+    .slice()
+    .sort((a, b) => {
+      const aCited = citedSet.has(a.index) ? 0 : 1;
+      const bCited = citedSet.has(b.index) ? 0 : 1;
+      return aCited - bCited;
+    })
+    .filter((item) => {
     const key = sourceKey(item);
     if (seen.has(key)) return false;
     seen.add(key);
-    // 对 figure / figure_region / whole_figure_fallback 按页面去重
-    // 同一页面裁剪出的多个图形区域视觉上重叠，只保留一张
     const meta = item.result.metadata as Record<string, unknown>;
     const assetKind = String(meta?.asset_kind || "");
     if (["figure", "figure_region", "whole_figure_fallback"].includes(assetKind)) {
@@ -287,7 +288,18 @@ function displayableResults(response: AnswerResponse): Array<{ result: SearchRes
     }
     return true;
   });
-  return merged.slice(0, 12);
+  // 被引用的按原始索引顺序排列（匹配答案中 [1][2][3] 顺序），未引用的排在后面
+  return merged
+    .sort((a, b) => {
+      const aCited = citedSet.has(a.index);
+      const bCited = citedSet.has(b.index);
+      if (aCited && bCited) return a.index - b.index;
+      if (aCited) return -1;
+      if (bCited) return 1;
+      return a.index - b.index;
+    })
+    .slice(0, 12)
+    .map((item) => ({ ...item, cited: citedSet.has(item.index) }));
 }
 
 function stripSummaryNoise(query: string): string {
@@ -721,35 +733,111 @@ function ImageLightbox({
   );
 }
 
+// 弱相关内容关键词——匹配到的图片即使被 LLM 引用，也归入"引用图片资料"区
+const WEAK_IMAGE_KEYWORDS = [
+  "笔录", "询问人", "被询问人", "谈话记录", "签到", "签字", "盖章", "签章",
+  "登记表", "审批表", "检查表", "记录表", "申请表",
+  "巡查记录", "值班记录", "维修记录", "保养记录",
+  "扫描件", "复印件",
+  "备案", "存档", "归档", "档案",
+  "通知书", "告知书", "确认书",
+  "新闻", "报道", "日报", "周报", "月报", "简报",
+  "公告", "公示", "声明",
+  // 示意图、封面、目录、装饰等非现场类内容
+  "示意图", "装饰", "背景", "背景图",
+  "封面", "目录", "页眉", "页脚",
+];
+
+function isWeakImage(item: { result: SearchResult }): boolean {
+  const meta = item.result.metadata as Record<string, unknown>;
+  // 后端已标注的 paper_record（笔录、登记表等文书类）
+  if (meta?.paper_record === true) return true;
+  // 装饰性图片（logo、水印、背景图案等 VLM 分类）
+  if (String(meta?.image_class || "") === "SCENE_IMAGE") return true;
+  // VLM 判定为不可用于问答
+  if (meta?.usable_for_qa === false) return true;
+  // 内容片段命中弱相关关键词
+  const snippet = item.result.snippet || "";
+  if (WEAK_IMAGE_KEYWORDS.some((kw) => snippet.includes(kw))) return true;
+  // 区域摘要（region_summary）也检查
+  const regionSummary = String(meta?.region_summary || "");
+  if (regionSummary && WEAK_IMAGE_KEYWORDS.some((kw) => regionSummary.includes(kw))) return true;
+  // 核心主题（core_topic）也检查
+  const coreTopic = String(meta?.core_topic || "");
+  if (coreTopic && WEAK_IMAGE_KEYWORDS.some((kw) => coreTopic.includes(kw))) return true;
+  return false;
+}
+
 function InlineEvidenceGallery({
   items,
   onOpen,
 }: {
-  items: Array<{ result: SearchResult; index: number }>;
+  items: Array<{ result: SearchResult; index: number; cited: boolean }>;
   onOpen: (index: number) => void;
 }) {
   if (!items.length) return null;
 
+  // 最高分为参照；得分低于此比例的被归入引用区
+  const maxScore = Math.max(...items.map(i => i.result.score), 0.01);
+  const SCORE_RATIO_FLOOR = 0.35;
+
+  // 强相关图片（被 LLM 引用 + 非弱内容 + 得分未显著落后）
+  // 弱相关图片 = 其余全部归入"引用图片资料"区
+  const strongItems = items.filter((item) => {
+    if (!item.cited) return false;
+    if (isWeakImage(item)) return false;
+    if (item.result.score < maxScore * SCORE_RATIO_FLOOR) return false;
+    return true;
+  });
+  const refItems = items.filter((item) => {
+    return !item.cited || isWeakImage(item) || item.result.score < maxScore * SCORE_RATIO_FLOOR;
+  });
+
   return (
     <section className="inline-evidence-gallery">
-      <div className="inline-evidence-strip">
-        {items.map((item, thumbIndex) => {
-          const imageUrl = assetUrl(item.result.asset_url);
-          if (!imageUrl) return null;
-          return (
-            <button
-              type="button"
-              key={`${item.result.chunk_id}-${item.index}`}
-              className="inline-evidence-thumb"
-              onClick={() => onOpen(thumbIndex)}
-            >
-              <div className="inline-evidence-image-wrap">
-                <img src={imageUrl} alt={`${item.result.document_name} 第 ${item.result.page_number} 页`} onError={(e) => { (e.currentTarget.closest('button') as HTMLElement)?.style.setProperty('display', 'none'); }} />
-              </div>
-            </button>
-          );
-        })}
-      </div>
+      {strongItems.length > 0 && (
+        <div className="inline-evidence-strip">
+          {strongItems.map((item, thumbIndex) => {
+            const imageUrl = assetUrl(item.result.asset_url);
+            if (!imageUrl) return null;
+            return (
+              <button
+                type="button"
+                key={`${item.result.chunk_id}-${item.index}`}
+                className="inline-evidence-thumb"
+                onClick={() => onOpen(items.indexOf(item))}
+              >
+                <div className="inline-evidence-image-wrap">
+                  <img src={imageUrl} alt={`${item.result.document_name} 第 ${item.result.page_number} 页`} onError={(e) => { (e.currentTarget.closest('button') as HTMLElement)?.style.setProperty('display', 'none'); }} />
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {refItems.length > 0 && (
+        <>
+          <div className="inline-evidence-group-label">引用图片资料</div>
+          <div className="inline-evidence-strip">
+            {refItems.map((item, thumbIndex) => {
+              const imageUrl = assetUrl(item.result.asset_url);
+              if (!imageUrl) return null;
+              return (
+                <button
+                  type="button"
+                  key={`${item.result.chunk_id}-${item.index}`}
+                  className="inline-evidence-thumb"
+                  onClick={() => onOpen(items.indexOf(item))}
+                >
+                  <div className="inline-evidence-image-wrap">
+                    <img src={imageUrl} alt={`${item.result.document_name} 第 ${item.result.page_number} 页`} onError={(e) => { (e.currentTarget.closest('button') as HTMLElement)?.style.setProperty('display', 'none'); }} />
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </>
+      )}
     </section>
   );
 }
@@ -1080,7 +1168,19 @@ function SearchChatNext({
                               answer={turn.response.answer}
                               sourceCount={turn.response.results.length}
                               activeIndex={citationSelection?.turnId === turn.id ? citationSelection.sourceIndex : null}
-                              onSelect={(index) => onSelectCitation(turn.id, index)}
+                              onSelect={(index) => {
+                                const citedResult = turn.response.results[index];
+                                if (citedResult?.asset_url) {
+                                  const evidence = displayableResults(turn.response);
+                                  const matchIndex = evidence.findIndex(e => e.result.asset_url === citedResult.asset_url);
+                                  if (matchIndex >= 0) {
+                                    onCloseCitation();
+                                    openPreview(evidence, matchIndex);
+                                    return;
+                                  }
+                                }
+                                onSelectCitation(turn.id, index);
+                              }}
                             />
                           ) : inlineEvidence.length > 0 ? (
                             "已为您筛选出以下图片内容："

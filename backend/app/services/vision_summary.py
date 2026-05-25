@@ -58,18 +58,25 @@ class VisionSummaryService:
         *,
         extracted_text: str = "",
         context_text: str = "",
+        extract_ocr: bool = False,
     ) -> dict[str, object]:
         fallback = self._fallback_region_summary(extracted_text=extracted_text, context_text=context_text)
         if not self.configured or not self.settings.figure_region_vision_enabled:
             return fallback
         path = Path(image_path)
+        fields = (
+            '"scene_type", "area_name", "floor_or_building", "visible_labels", '
+            '"key_symbols", "route_description", "exits_or_destinations", "legend_summary", "confidence"'
+        )
+        if extract_ocr:
+            fields += ', "ocr_text"'
         prompt = (
-            "请阅读这张工程图纸、现场疏散图、流程图或平面示意图，并输出一个 JSON 对象。"
+            "请阅读这张工程图纸、现场疏散图、流程图、平面示意图、线路图、配电系统图或接线示意图，并输出一个 JSON 对象。"
             "只输出 JSON，不要额外解释。"
-            '字段必须包含: "scene_type", "area_name", "floor_or_building", "visible_labels", '
-            '"key_symbols", "route_description", "exits_or_destinations", "legend_summary", "confidence"。'
+            f'字段必须包含: {fields}。'
             "其中 visible_labels、key_symbols、exits_or_destinations 必须是字符串数组，confidence 为 0 到 1 的数字。"
             "重点识别区域名、楼层/分区、箭头、出口、编号、图例、路线和可见文字。"
+            "如果是线路图/电气图/配电图，注意识别：配电柜编号、电缆规格、断路器参数、线路走向、设备标签和说明文字。"
             f"\n\n已识别文本：{extracted_text[:1200] or '无'}"
             f"\n\n页面上下文：{context_text[:1200] or '无'}"
         )
@@ -78,29 +85,30 @@ class VisionSummaryService:
             parsed = self._parse_json_object(raw)
             if not parsed:
                 return fallback
-            return self._normalize_region_summary(parsed, fallback)
+            return self._normalize_region_summary(parsed, fallback, extract_ocr=extract_ocr)
         except Exception:
             return fallback
 
     def region_summary_text(self, summary: dict[str, object]) -> str:
-        values: list[str] = []
-        for key in [
-            "scene_type",
-            "area_name",
-            "floor_or_building",
-            "route_description",
-            "legend_summary",
-        ]:
+        parts: list[str] = []
+        field_labels = {
+            "scene_type": "场景类型",
+            "area_name": "区域名称",
+            "floor_or_building": "楼层/建筑",
+            "route_description": "路线描述",
+            "legend_summary": "图例说明",
+        }
+        for key, label in field_labels.items():
             value = str(summary.get(key) or "").strip()
             if value:
-                values.append(value)
-        for key in ["visible_labels", "key_symbols", "exits_or_destinations"]:
+                parts.append(f"{label}：{value}")
+        for key, label in [("visible_labels", "可见标签"), ("key_symbols", "关键符号"), ("exits_or_destinations", "出口/目标")]:
             raw = summary.get(key) or []
             if isinstance(raw, list):
                 items = [str(item).strip() for item in raw if str(item).strip()]
                 if items:
-                    values.append(" ".join(items))
-        return " ".join(values).strip()
+                    parts.append(f"{label}：{' '.join(items)}")
+        return " ".join(parts).strip()
 
     def _chat_with_image(self, path: Path, prompt: str, model: str, temperature: float) -> str:
         mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
@@ -154,6 +162,8 @@ class VisionSummaryService:
         self,
         parsed: dict[str, object],
         fallback: dict[str, object],
+        *,
+        extract_ocr: bool = False,
     ) -> dict[str, object]:
         normalized: dict[str, object] = {}
         for key in [
@@ -173,6 +183,9 @@ class VisionSummaryService:
                 normalized[key] = [str(raw).strip()]
             else:
                 normalized[key] = list(fallback.get(key) or [])
+        if extract_ocr:
+            raw_ocr = parsed.get("ocr_text") or fallback.get("ocr_text") or ""
+            normalized["ocr_text"] = str(raw_ocr).strip()
         try:
             confidence = float(parsed.get("confidence", fallback.get("confidence", 0.35)) or 0.35)
         except (TypeError, ValueError):
@@ -192,6 +205,7 @@ class VisionSummaryService:
             "route_description": joined[:240],
             "exits_or_destinations": [],
             "legend_summary": joined[:240],
+            "ocr_text": extracted_text[:1200] if extracted_text else "",
             "confidence": 0.2,
         }
 
@@ -240,6 +254,7 @@ class VisionSummaryService:
             "- 无关占位图：clip art、无关图标、广告图\n"
             "注意：照片、现场图、人物图、风景图如果出现在工程文档中，属于文档内容一部分，不是SCENE_IMAGE。\n\n"
             "除此以外，所有图片均属于【DOC_IMAGE — 文档资料图】。\n\n"
+            "对于线路图、配电系统图、接线图、电路图、电气原理图，请归类为 DOC_IMAGE 并将 core_topic 设置为具体图纸类型（如「配电系统图」「消防线路图」「电气接线图」等）。\n\n"
             "只输出 JSON，不要额外解释。字段：\n"
             '{"image_class": "DOC_IMAGE" 或 "SCENE_IMAGE", '
             '"class_confidence": 0-1的小数, '

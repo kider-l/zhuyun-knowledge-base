@@ -118,10 +118,10 @@ def _component_regions(
     width: int,
     height: int,
     *,
-    min_area_ratio: float = 0.015,
-    min_width_ratio: float = 0.18,
-    min_height_ratio: float = 0.12,
-    min_density: float = 0.08,
+    min_area_ratio: float = 0.008,
+    min_width_ratio: float = 0.12,
+    min_height_ratio: float = 0.06,
+    min_density: float = 0.04,
 ) -> list[LayoutRegion]:
     image_area = max(width * height, 1)
     regions: list[LayoutRegion] = []
@@ -163,25 +163,47 @@ def _projection_segments(values: list[float], min_gap: int) -> list[tuple[int, i
 def _split_by_projection(mask: list[list[int]], width: int, height: int) -> list[tuple[float, float, float, float]]:
     row_density = [sum(row) / max(width, 1) for row in mask]
     col_density = [sum(mask[row][col] for row in range(height)) / max(height, 1) for col in range(width)]
-    candidate_gaps: list[tuple[str, int, int, int]] = []
+
+    gaps: list[tuple[str, int, int, int]] = []
     for start, end in _projection_segments(row_density, max(10, height // 40)):
-        candidate_gaps.append(("y", start, end, end - start))
+        gaps.append(("y", start, end, end - start))
     for start, end in _projection_segments(col_density, max(10, width // 40)):
-        candidate_gaps.append(("x", start, end, end - start))
-    if not candidate_gaps:
+        gaps.append(("x", start, end, end - start))
+    if not gaps:
         return [(0.0, 0.0, 1.0, 1.0)]
-    axis, start, end, _span = max(candidate_gaps, key=lambda item: item[3])
-    if axis == "y":
-        top = start / max(height, 1)
-        bottom = end / max(height, 1)
-        if top < 0.18 or bottom > 0.82:
-            return [(0.0, 0.0, 1.0, 1.0)]
-        return [(0.0, 0.0, 1.0, top), (0.0, bottom, 1.0, 1.0)]
-    left = start / max(width, 1)
-    right = end / max(width, 1)
-    if left < 0.18 or right > 0.82:
-        return [(0.0, 0.0, 1.0, 1.0)]
-    return [(0.0, 0.0, left, 1.0), (right, 0.0, 1.0, 1.0)]
+    gaps.sort(key=lambda item: item[3], reverse=True)
+
+    # 递归切割：每次选最大间隙，在子区域上继续切割
+    regions = [(0.0, 0.0, 1.0, 1.0)]
+    for axis, start, end, _span in gaps:
+        next_regions: list[tuple[float, float, float, float]] = []
+        for rx0, ry0, rx1, ry1 in regions:
+            rw = max(rx1 - rx0, 1e-6)
+            rh = max(ry1 - ry0, 1e-6)
+            if axis == "y":
+                top_rel = start / max(height, 1)
+                bottom_rel = end / max(height, 1)
+                top = (top_rel - ry0) / rh
+                bottom = (bottom_rel - ry0) / rh
+                if top > 0.12 and bottom < 0.88:
+                    next_regions.append((rx0, ry0, rx1, ry0 + rh * top))
+                    next_regions.append((rx0, ry0 + rh * bottom, rx1, ry1))
+                else:
+                    next_regions.append((rx0, ry0, rx1, ry1))
+            else:
+                left_rel = start / max(width, 1)
+                right_rel = end / max(width, 1)
+                left = (left_rel - rx0) / rw
+                right = (right_rel - rx0) / rw
+                if left > 0.12 and right < 0.88:
+                    next_regions.append((rx0, ry0, rx0 + rw * left, ry1))
+                    next_regions.append((rx0 + rw * right, ry0, rx1, ry1))
+                else:
+                    next_regions.append((rx0, ry0, rx1, ry1))
+        regions = next_regions
+        if len(regions) >= 8:
+            break
+    return regions
 
 
 class LayoutAnalysisService:
@@ -221,7 +243,7 @@ class LayoutAnalysisService:
                 height,
                 min_area_ratio=0.006,
                 min_width_ratio=0.08,
-                min_height_ratio=0.12,
+                min_height_ratio=0.05,
                 min_density=0.006,
             )
             regions = [
