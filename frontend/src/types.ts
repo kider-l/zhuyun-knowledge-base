@@ -178,6 +178,19 @@ export interface SystemStatus {
     running_jobs: number;
     ocr_enabled: boolean;
     ocr_backend: string;
+    ocr_paddle_enabled?: boolean;
+    ocr_paddle_available?: boolean;
+    ocr_cloud_enabled?: boolean;
+    ocr_cloud_available?: boolean;
+    ocr_last_error?: string | null;
+    ocr_stats?: {
+      paddle_ocr_pages: number;
+      cloud_ocr_pages: number;
+      cloud_ocr_attempted_pages?: number;
+      ocr_fallback_pages: number;
+      ocr_failed_pages: number;
+      table_structured_pages: number;
+    };
     reranker_enabled: boolean;
     reranker_reachable: boolean;
     reranker_healthy: boolean;

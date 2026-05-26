@@ -325,6 +325,11 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
         "text_pages": 0,
         "ocr_pages": 0,
         "needs_ocr_pages": 0,
+        "paddle_ocr_pages": 0,
+        "cloud_ocr_pages": 0,
+        "cloud_ocr_attempted_pages": 0,
+        "ocr_fallback_pages": 0,
+        "ocr_failed_pages": 0,
         "text_chunks": 0,
         "image_chunks": 0,
         "page_assets": 0,
@@ -333,6 +338,7 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
         "table_chunks": 0,
         "table_summaries": 0,
         "structured_tables": 0,
+        "table_structured_pages": 0,
         "legacy_page_chunks": 0,
         "legacy_embedded_chunks": 0,
         "figure_regions": 0,
@@ -341,7 +347,7 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
         "fallback_whole_figure_count": 0,
         "figure_region_diagnostics": [],
         "text_chars": 0,
-        "ocr_backend": "cloud_vl" if ocr.backend in {"", "none", "disabled"} and ocr.settings.cloud_ocr_enabled else ocr.backend,
+        "ocr_backend": ocr.effective_backend,
         "warnings": [],
     }
 
@@ -377,18 +383,36 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
             ocr_meta: dict = {}
             ocr_lines: list[dict] = []
             needs_page_ocr = len(page_text) < 40
-            ocr_page_count = stats.get("ocr_pages", 0) + stats.get("needs_ocr_pages", 0)
-            if needs_page_ocr and ocr_page_count < ocr.settings.cloud_ocr_max_pages:
-                ocr_result = ocr.recognize(page_asset_path)
+            cloud_ocr_page_count = int(stats.get("cloud_ocr_attempted_pages", 0))
+            allow_cloud_ocr = cloud_ocr_page_count < ocr.settings.cloud_ocr_max_pages
+            allow_page_ocr = needs_page_ocr and ocr.enabled and (
+                ocr.paddle_enabled
+                or ocr.backend == "tesseract"
+                or (ocr.cloud_enabled and allow_cloud_ocr)
+                or not ocr.cloud_enabled
+            )
+            if allow_page_ocr:
+                ocr_result = ocr.recognize(page_asset_path, allow_cloud=allow_cloud_ocr)
                 ocr_text = ocr_result["text"]
                 ocr_meta = ocr_result["meta"]
                 ocr_lines = ocr_result["lines"]
                 page_asset.ocr_text = ocr_text or None
+                attempted = [str(item) for item in ocr_meta.get("attempted", []) if str(item)]
+                if "cloud_vl" in attempted:
+                    stats["cloud_ocr_attempted_pages"] += 1
                 if ocr_text:
                     stats["ocr_pages"] += 1
+                    backend_used = str(ocr_meta.get("backend") or "")
+                    if backend_used == "paddle":
+                        stats["paddle_ocr_pages"] += 1
+                    elif backend_used == "cloud_vl":
+                        stats["cloud_ocr_pages"] += 1
+                    if bool(ocr_meta.get("fallback_used")) or ("paddle" in attempted and "cloud_vl" in attempted):
+                        stats["ocr_fallback_pages"] += 1
                 else:
                     stats["needs_ocr_pages"] += 1
-                    if ocr_meta.get("error"):
+                    stats["ocr_failed_pages"] += 1
+                    if ocr_meta.get("error") or ocr_meta.get("quality_reason") or ocr_meta.get("cloud_skip_reason"):
                         stats["warnings"].append({"page": page_number, "ocr": ocr_meta})
 
             full_text = normalize_text("\n\n".join(part for part in [page_text, ocr_text] if part))
@@ -474,6 +498,7 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
                 structured = ocr.extract_table_structure(table_path)
                 if structured["meta"].get("structured"):
                     stats["structured_tables"] += 1
+                    stats["table_structured_pages"] += 1
                 extracted_table_text = normalize_text(
                     "\n".join(part for part in [extracted_table_text, str(structured.get("text") or "")] if part)
                 )
@@ -700,14 +725,14 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
                         "summary_text": "",
                         "classification": {"image_class": "DOC_IMAGE", "class_confidence": 0.5, "core_topic": "", "image_keywords": [], "usable_for_qa": True},
                     }
-                # Regular regions: combine OCR into summarization (saves 1 API call)
+                region_ocr = ocr.recognize_region(t["region_path"])
                 r_summary = vision_summary.summarize_figure_region(
                     t["region_path"],
-                    extracted_text="",
+                    extracted_text=region_ocr["text"],
                     context_text=full_text,
-                    extract_ocr=True,
+                    extract_ocr=False,
                 )
-                r_ocr_text = str(r_summary.get("ocr_text", "")).strip()
+                r_ocr_text = str(region_ocr.get("text") or "").strip()
                 r_summary_text = vision_summary.region_summary_text(r_summary)
                 r_img_class = vision_summary.classify_image(
                     t["region_path"],
@@ -717,7 +742,7 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
                     chapter_info=title_path or "",
                 )
                 return {
-                    "ocr": {"text": r_ocr_text, "meta": {"backend": "combined_vlm", "available": bool(r_ocr_text), "has_line_boxes": False}, "lines": []},
+                    "ocr": region_ocr,
                     "ocr_text": r_ocr_text,
                     "summary": r_summary,
                     "summary_text": r_summary_text,

@@ -1,9 +1,13 @@
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import TypedDict
 
 from app.config import get_settings
 from app.services.vision_summary import get_vision_summary_service
+
+
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 
 class OCRLine(TypedDict):
@@ -44,22 +48,138 @@ class OCRService:
     def enabled(self) -> bool:
         return self.backend not in {"", "none", "disabled"} or self.settings.cloud_ocr_enabled
 
-    def recognize(self, image_path: Path) -> OCRResult:
-        if self.backend in {"", "none", "disabled"} and self.settings.cloud_ocr_enabled:
-            return self._recognize_cloud(image_path)
+    @property
+    def paddle_enabled(self) -> bool:
+        return self.backend == "paddle"
+
+    @property
+    def cloud_enabled(self) -> bool:
+        return self.settings.cloud_ocr_enabled
+
+    @property
+    def paddle_available(self) -> bool:
+        if not self.paddle_enabled:
+            return False
+        try:
+            import paddleocr  # type: ignore  # noqa: F401
+            import paddle  # type: ignore  # noqa: F401
+        except Exception:
+            return False
+        return True
+
+    @property
+    def cloud_available(self) -> bool:
+        return get_vision_summary_service().configured
+
+    @property
+    def effective_backend(self) -> str:
+        if self.paddle_enabled and self.cloud_enabled:
+            return "hybrid"
+        if self.paddle_enabled:
+            return "paddle"
+        if self.cloud_enabled:
+            return "cloud"
+        return "none"
+
+    def diagnostics(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "backend": self.effective_backend,
+            "paddle_enabled": self.paddle_enabled,
+            "paddle_available": self.paddle_available,
+            "cloud_enabled": self.cloud_enabled,
+            "cloud_available": self.cloud_available,
+        }
+
+    def recognize(self, image_path: Path, *, allow_cloud: bool = True) -> OCRResult:
         if not self.enabled:
             return _empty_result({"backend": "none", "available": False})
+        attempted: list[str] = []
+
         if self.backend == "tesseract":
-            return self._recognize_tesseract(image_path)
-        if self.backend == "paddle":
-            return self._recognize_paddle(image_path)
+            result = self._recognize_tesseract(image_path)
+            quality = self._quality_check(result)
+            result["meta"]["attempted"] = ["tesseract"]
+            result["meta"]["fallback_used"] = False
+            result["meta"]["quality_ok"] = quality["ok"]
+            result["meta"]["quality_reason"] = quality["reason"]
+            return result
+
+        if self.paddle_enabled:
+            attempted.append("paddle")
+            paddle_result = self._recognize_paddle(image_path)
+            paddle_quality = self._quality_check(paddle_result)
+            if paddle_quality["ok"]:
+                paddle_result["meta"]["attempted"] = attempted
+                paddle_result["meta"]["fallback_used"] = False
+                paddle_result["meta"]["quality_ok"] = True
+                paddle_result["meta"]["quality_reason"] = paddle_quality["reason"]
+                return paddle_result
+            paddle_result["meta"]["quality_ok"] = False
+            paddle_result["meta"]["quality_reason"] = paddle_quality["reason"]
+            if self.cloud_enabled and allow_cloud:
+                attempted.append("cloud_vl")
+                cloud_result = self._recognize_cloud(image_path)
+                cloud_quality = self._quality_check(cloud_result)
+                if cloud_quality["ok"]:
+                    cloud_result["meta"]["attempted"] = attempted
+                    cloud_result["meta"]["fallback_used"] = True
+                    cloud_result["meta"]["fallback_from"] = "paddle"
+                    cloud_result["meta"]["quality_ok"] = True
+                    cloud_result["meta"]["quality_reason"] = cloud_quality["reason"]
+                    cloud_result["meta"]["previous_quality_reason"] = paddle_quality["reason"]
+                    if paddle_result["meta"].get("error"):
+                        cloud_result["meta"]["previous_error"] = paddle_result["meta"]["error"]
+                    return cloud_result
+                cloud_result["meta"]["quality_ok"] = False
+                cloud_result["meta"]["quality_reason"] = cloud_quality["reason"]
+                fallback_meta = {
+                    "backend": "hybrid",
+                    "available": False,
+                    "attempted": attempted,
+                    "quality_ok": False,
+                    "quality_reason": cloud_quality["reason"],
+                    "paddle_quality_reason": paddle_quality["reason"],
+                    "fallback_used": True,
+                }
+                if paddle_result["meta"].get("error"):
+                    fallback_meta["paddle_error"] = paddle_result["meta"]["error"]
+                if cloud_result["meta"].get("error"):
+                    fallback_meta["cloud_error"] = cloud_result["meta"]["error"]
+                return _empty_result(fallback_meta)
+            if self.cloud_enabled and not allow_cloud:
+                paddle_result["meta"]["cloud_skipped"] = True
+                paddle_result["meta"]["cloud_skip_reason"] = "cloud_ocr_page_limit"
+
+            paddle_result["meta"]["attempted"] = attempted
+            paddle_result["meta"]["fallback_used"] = False
+            paddle_result["meta"]["quality_ok"] = False
+            return paddle_result
+
+        if self.backend in {"", "none", "disabled"} and self.cloud_enabled and allow_cloud:
+            result = self._recognize_cloud(image_path)
+            result["meta"]["attempted"] = ["cloud_vl"]
+            result["meta"]["fallback_used"] = False
+            cloud_quality = self._quality_check(result)
+            result["meta"]["quality_ok"] = cloud_quality["ok"]
+            result["meta"]["quality_reason"] = cloud_quality["reason"]
+            return result
+        if self.backend in {"", "none", "disabled"} and self.cloud_enabled and not allow_cloud:
+            return _empty_result({
+                "backend": "cloud_vl",
+                "available": False,
+                "attempted": [],
+                "cloud_skipped": True,
+                "cloud_skip_reason": "cloud_ocr_page_limit",
+            })
+
         return _empty_result({"backend": self.backend, "available": False, "error": "unsupported OCR_BACKEND"})
 
     def recognize_region(self, image_path: Path) -> OCRResult:
-        if self.settings.figure_region_ocr_enabled and self.backend == "paddle":
-            result = self._recognize_paddle(image_path)
-            if result["text"].strip():
-                return result
+        if self.settings.figure_region_ocr_enabled:
+            result = self.recognize(image_path)
+            result["meta"]["region_mode"] = True
+            return result
         return self.recognize(image_path)
 
     def extract_table_structure(self, image_path: Path) -> dict:
@@ -85,14 +205,61 @@ class OCRService:
                 "text": text.strip(),
                 "lines": [],
                 "meta": {
-                "backend": "cloud_vl",
-                "model": self.settings.cloud_ocr_model,
-                "available": bool(text.strip()),
+                    "backend": "cloud_vl",
+                    "model": self.settings.cloud_ocr_model,
+                    "available": bool(text.strip()),
                     "has_line_boxes": False,
                 },
             }
         except Exception as exc:
             return _empty_result({"backend": "cloud_vl", "available": False, "error": str(exc), "has_line_boxes": False})
+
+    def _quality_check(self, result: OCRResult) -> dict[str, object]:
+        text = str(result.get("text") or "").strip()
+        if result.get("meta", {}).get("error"):
+            return {"ok": False, "reason": "error", "text_length": len(text)}
+        if len(text) < 20:
+            return {"ok": False, "reason": "too_short", "text_length": len(text)}
+        compact = "".join(text.split())
+        if len(compact) < 12:
+            return {"ok": False, "reason": "too_short_compact", "text_length": len(text)}
+        unique_ratio = len(set(compact)) / max(len(compact), 1)
+        if unique_ratio < 0.08:
+            return {
+                "ok": False,
+                "reason": "low_unique_character_ratio",
+                "text_length": len(text),
+                "unique_ratio": unique_ratio,
+            }
+        repeated_ratio = self._max_run_ratio(compact)
+        if repeated_ratio > 0.65:
+            return {
+                "ok": False,
+                "reason": "repeated_character_run",
+                "text_length": len(text),
+                "repeated_ratio": repeated_ratio,
+            }
+        return {"ok": True, "reason": "ok", "text_length": len(text), "unique_ratio": unique_ratio}
+
+    def _result_quality_ok(self, result: OCRResult) -> bool:
+        return bool(self._quality_check(result)["ok"])
+
+    @staticmethod
+    def _max_run_ratio(text: str) -> float:
+        if not text:
+            return 0.0
+        longest = 1
+        current = 1
+        previous = text[0]
+        for char in text[1:]:
+            if char == previous:
+                current += 1
+            else:
+                longest = max(longest, current)
+                current = 1
+                previous = char
+        longest = max(longest, current)
+        return longest / max(len(text), 1)
 
     def _recognize_tesseract(self, image_path: Path) -> OCRResult:
         try:

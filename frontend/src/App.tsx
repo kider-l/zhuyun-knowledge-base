@@ -1320,6 +1320,26 @@ function SystemStatusPanel({
           <strong>{status.services.ocr_enabled ? `已启用 · ${status.services.ocr_backend}` : "未启用完整 OCR"}</strong>
         </div>
         <div>
+          <span>Paddle OCR</span>
+          <strong>
+            {status.services.ocr_paddle_enabled
+              ? status.services.ocr_paddle_available
+                ? "已启用 · 可用"
+                : "已启用 · 不可用"
+              : "未启用"}
+          </strong>
+        </div>
+        <div>
+          <span>Cloud OCR</span>
+          <strong>
+            {status.services.ocr_cloud_enabled
+              ? status.services.ocr_cloud_available
+                ? "已启用 · 可用"
+                : "已启用 · 不可用"
+              : "未启用"}
+          </strong>
+        </div>
+        <div>
           <span>重排服务</span>
           <strong>
             {!status.services.reranker_enabled
@@ -1332,6 +1352,19 @@ function SystemStatusPanel({
           </strong>
         </div>
       </div>
+      {status.services.ocr_stats && (
+        <div className="notice">
+          OCR 统计：Paddle 页 {status.services.ocr_stats.paddle_ocr_pages}，云 OCR 页 {status.services.ocr_stats.cloud_ocr_pages}，
+          云 OCR 尝试页 {status.services.ocr_stats.cloud_ocr_attempted_pages ?? status.services.ocr_stats.cloud_ocr_pages}，
+          回退页 {status.services.ocr_stats.ocr_fallback_pages}，失败页 {status.services.ocr_stats.ocr_failed_pages}，
+          结构化表格 {status.services.ocr_stats.table_structured_pages}。
+        </div>
+      )}
+      {status.services.ocr_last_error && (
+        <div className="notice warning">
+          最近一次 OCR 失败原因：{status.services.ocr_last_error}
+        </div>
+      )}
       {status.services.reranker_enabled && !status.services.reranker_healthy && (
         <div className="notice warning">
           重排服务已启用但当前不可用。{status.services.reranker_error ? `原因：${status.services.reranker_error}` : "后端会自动回退到原始召回排序。"}
@@ -1770,6 +1803,11 @@ function AdminSite({ section }: { section: AdminSection }) {
     setJobs(nextJobs);
     setLogs(nextLogs);
     setSystemStatus(nextStatus);
+    setMessage((current) =>
+      current.includes("网络连接异常") || current.includes("登录已过期")
+        ? ""
+        : current,
+    );
   }, []);
 
   useEffect(() => {

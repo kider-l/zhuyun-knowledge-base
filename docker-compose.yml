@@ -36,6 +36,12 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://graphsearch:graphsearch@postgres:5432/graphsearch
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      USE_RQ: "true"
+      STORAGE_DIR: /data/storage
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,6 +66,12 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://graphsearch:graphsearch@postgres:5432/graphsearch
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      USE_RQ: "true"
+      STORAGE_DIR: /data/storage
     depends_on:
       postgres:
         condition: service_healthy
@@ -103,13 +115,15 @@ services:
 
   frontend-dev:
     image: node:20-alpine
+    profiles:
+      - dev
     working_dir: /app
     command: sh -c "npm install && npm run dev"
     restart: unless-stopped
     depends_on:
       - api
     ports:
-      - "5173:5173"
+      - "5174:5173"
     volumes:
       - ./frontend:/app
       - /app/node_modules

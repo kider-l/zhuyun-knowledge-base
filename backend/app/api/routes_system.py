@@ -8,6 +8,7 @@ from app.db import get_schema_status, get_session
 from app.models import Asset, Chunk, Document, Job
 from app.schemas import JobOut
 from app.services.embeddings import get_embedding_service
+from app.services.ocr import get_ocr_service
 from app.services.reranker import get_reranker_health
 from app.services.scheduler import enqueue_index
 from app.services.vector_store import VectorStore
@@ -32,6 +33,23 @@ def system_status(_: AdminUser, db: Session = Depends(get_session)) -> dict:
     settings = get_settings()
     embedding_service = get_embedding_service()
     reranker = get_reranker_health()
+    latest_document_stats = (
+        db.execute(
+            select(Document.parse_stats)
+            .where(Document.parse_stats.is_not(None))
+            .order_by(Document.updated_at.desc())
+        )
+        .scalars()
+        .first()
+        or {}
+    )
+    if not isinstance(latest_document_stats, dict):
+        latest_document_stats = {}
+    latest_ocr_warning = {}
+    for warning in reversed(latest_document_stats.get("warnings", []) or []):
+        if isinstance(warning, dict) and isinstance(warning.get("ocr"), dict):
+            latest_ocr_warning = warning["ocr"]
+            break
     total_documents = db.scalar(select(func.count(Document.id))) or 0
     approved_documents = db.scalar(select(func.count(Document.id)).where(Document.status == "approved")) or 0
     parsed_documents = db.scalar(select(func.count(Document.id)).where(Document.status == "parsed")) or 0
@@ -51,6 +69,8 @@ def system_status(_: AdminUser, db: Session = Depends(get_session)) -> dict:
     )
     running_jobs = db.scalar(select(func.count(Job.id)).where(Job.status.in_(["queued", "running"]))) or 0
     schema_status = get_schema_status()
+    ocr_service = get_ocr_service()
+    ocr_diag = ocr_service.diagnostics()
     requires_reindex = bool(
         db.scalar(
             select(func.count(Chunk.id))
@@ -98,8 +118,30 @@ def system_status(_: AdminUser, db: Session = Depends(get_session)) -> dict:
             "qdrant_available": VectorStore().available,
             "use_rq": settings.use_rq,
             "running_jobs": running_jobs,
-            "ocr_enabled": settings.ocr_backend != "none" or settings.cloud_ocr_enabled,
-            "ocr_backend": settings.ocr_backend if settings.ocr_backend != "none" else ("cloud" if settings.cloud_ocr_enabled else "none"),
+            "ocr_enabled": ocr_diag["enabled"],
+            "ocr_backend": ocr_diag["backend"],
+            "ocr_paddle_enabled": ocr_diag["paddle_enabled"],
+            "ocr_paddle_available": ocr_diag["paddle_available"],
+            "ocr_cloud_enabled": ocr_diag["cloud_enabled"],
+            "ocr_cloud_available": ocr_diag["cloud_available"],
+            "ocr_last_error": (
+                latest_ocr_warning.get("error")
+                or latest_ocr_warning.get("cloud_error")
+                or latest_ocr_warning.get("paddle_error")
+                or latest_ocr_warning.get("quality_reason")
+                or latest_ocr_warning.get("cloud_skip_reason")
+            ),
+            "ocr_stats": {
+                "paddle_ocr_pages": latest_document_stats.get("paddle_ocr_pages", 0),
+                "cloud_ocr_pages": latest_document_stats.get("cloud_ocr_pages", 0),
+                "cloud_ocr_attempted_pages": latest_document_stats.get("cloud_ocr_attempted_pages", 0),
+                "ocr_fallback_pages": latest_document_stats.get("ocr_fallback_pages", 0),
+                "ocr_failed_pages": latest_document_stats.get("ocr_failed_pages", 0),
+                "table_structured_pages": latest_document_stats.get(
+                    "table_structured_pages",
+                    latest_document_stats.get("structured_tables", 0),
+                ),
+            },
             "reranker_enabled": reranker.enabled,
             "reranker_reachable": reranker.reachable,
             "reranker_healthy": reranker.healthy,
