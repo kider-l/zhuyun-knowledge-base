@@ -11,3 +11,8 @@ backend/storage/
 *backup*/
 *.corrupted-*.tsx
 .env
+
+.venv-win/
+.codex-run/
+
+.venv-ocr/

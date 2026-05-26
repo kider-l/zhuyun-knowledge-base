@@ -8,6 +8,8 @@ from app.services.vision_summary import get_vision_summary_service
 
 
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+os.environ.setdefault("DNNL_DISABLE", "1")
+os.environ.setdefault("CPU_NUM", "1")
 
 
 class OCRLine(TypedDict):
