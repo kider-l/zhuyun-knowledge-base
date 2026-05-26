@@ -3,7 +3,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
-from sqlalchemy import desc, select
+from sqlalchemy import delete, desc, select
 from sqlalchemy.orm import Session
 
 from app.auth import AdminUser
@@ -28,12 +28,46 @@ from app.services.storage import import_local_file, probe_file, probe_upload_str
 from app.services.vector_store import VectorStore
 
 router = APIRouter(prefix="/api", tags=["documents"])
+DELETED_DOCUMENT_STATUS = "deleted"
 
 
 def _asset_out(asset: Asset) -> AssetOut:
     item = AssetOut.model_validate(asset)
     item.url = f"/api/assets/{asset.id}"
     return item
+
+
+def _document_out(document: Document) -> DocumentOut:
+    return DocumentOut.model_validate(document)
+
+
+def _job_out(job: Job) -> JobOut:
+    item = JobOut.model_validate(job)
+    filename = None
+    if job.document and job.document.status != DELETED_DOCUMENT_STATUS:
+        filename = job.document.filename
+    return item.model_copy(update={"document_filename": filename})
+
+
+def _find_duplicate_document(db: Session, sha256: str) -> Document | None:
+    return (
+        db.execute(
+            select(Document)
+            .where(Document.sha256 == sha256, Document.status != DELETED_DOCUMENT_STATUS)
+            .limit(1)
+        )
+        .scalar_one_or_none()
+    )
+
+
+def _document_exists(db: Session, document_id: str) -> bool:
+    return (
+        db.execute(
+            select(Document.id).where(Document.id == document_id, Document.status != DELETED_DOCUMENT_STATUS).limit(1)
+        )
+        .scalar_one_or_none()
+        is not None
+    )
 
 
 def _create_parse_job(db: Session, document: Document) -> Job:
@@ -190,7 +224,7 @@ def upload_documents(
         sha256, size = probe_upload_stream(file.file)
         if size > max_bytes:
             raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"{file.filename} 超过上传大小限制")
-        duplicate_doc = db.execute(select(Document).where(Document.sha256 == sha256).limit(1)).scalar_one_or_none()
+        duplicate_doc = _find_duplicate_document(db, sha256)
         duplicate_batch_filename = seen_hashes.get(sha256)
         if duplicate_doc is not None:
             duplicates.append({"incoming_filename": file.filename, "existing": _duplicate_info(duplicate_doc).model_dump(mode="json")})
@@ -234,7 +268,7 @@ def upload_documents(
         concurrent_duplicates: list[dict] = []
         if not confirm_duplicates:
             for spec in specs:
-                duplicate_doc = db.execute(select(Document).where(Document.sha256 == spec["sha256"]).limit(1)).scalar_one_or_none()
+                duplicate_doc = _find_duplicate_document(db, spec["sha256"])
                 if duplicate_doc is not None:
                     concurrent_duplicates.append(
                         {
@@ -286,8 +320,8 @@ def upload_documents(
                     filename=file.filename,
                     status="queued",
                     message="已上传，等待解析",
-                    document=DocumentOut.model_validate(document),
-                    job=JobOut.model_validate(job),
+                    document=_document_out(document),
+                    job=_job_out(job),
                 )
             )
             enqueued.append((document, job))
@@ -325,7 +359,7 @@ def import_local(
         if pdf_path.suffix.lower() != ".pdf":
             continue
         sha256, size = probe_file(pdf_path)
-        duplicate_doc = db.execute(select(Document).where(Document.sha256 == sha256).limit(1)).scalar_one_or_none()
+        duplicate_doc = _find_duplicate_document(db, sha256)
         duplicate_batch_filename = seen_hashes.get(sha256)
         if duplicate_doc is not None:
             duplicates.append({"incoming_filename": pdf_path.name, "existing": _duplicate_info(duplicate_doc).model_dump(mode="json")})
@@ -369,7 +403,7 @@ def import_local(
         concurrent_duplicates: list[dict] = []
         if not payload.confirm_duplicates:
             for spec in specs:
-                duplicate_doc = db.execute(select(Document).where(Document.sha256 == spec["sha256"]).limit(1)).scalar_one_or_none()
+                duplicate_doc = _find_duplicate_document(db, spec["sha256"])
                 if duplicate_doc is not None:
                     concurrent_duplicates.append(
                         {
@@ -421,8 +455,8 @@ def import_local(
                     filename=pdf_path.name,
                     status="queued",
                     message="已导入，等待解析",
-                    document=DocumentOut.model_validate(document),
-                    job=JobOut.model_validate(job),
+                    document=_document_out(document),
+                    job=_job_out(job),
                 )
             )
             enqueued.append((document, job))
@@ -441,14 +475,28 @@ def import_local(
 
 @router.get("/documents", response_model=list[DocumentOut])
 def list_documents(_: AdminUser, db: Session = Depends(get_session)) -> list[DocumentOut]:
-    documents = db.execute(select(Document).order_by(desc(Document.created_at))).scalars().all()
-    return [DocumentOut.model_validate(document) for document in documents]
+    documents = (
+        db.execute(select(Document).where(Document.status != DELETED_DOCUMENT_STATUS).order_by(desc(Document.created_at)))
+        .scalars()
+        .all()
+    )
+    return [_document_out(document) for document in documents]
 
 
 @router.get("/jobs", response_model=list[JobOut])
 def list_jobs(_: AdminUser, db: Session = Depends(get_session)) -> list[JobOut]:
-    jobs = db.execute(select(Job).order_by(desc(Job.created_at)).limit(120)).scalars().all()
-    return [JobOut.model_validate(job) for job in jobs]
+    jobs = (
+        db.execute(
+            select(Job)
+            .join(Document, Document.id == Job.document_id)
+            .where(Document.status != DELETED_DOCUMENT_STATUS)
+            .order_by(desc(Job.created_at))
+            .limit(120)
+        )
+        .scalars()
+        .all()
+    )
+    return [_job_out(job) for job in jobs]
 
 
 @router.get("/upload-logs", response_model=list[UploadLogOut])
@@ -479,7 +527,7 @@ def list_upload_logs(_: AdminUser, db: Session = Depends(get_session)) -> list[U
 @router.get("/documents/{document_id}/review", response_model=DocumentReview)
 def document_review(document_id: str, _: AdminUser, db: Session = Depends(get_session)) -> DocumentReview:
     document = db.get(Document, document_id)
-    if not document:
+    if not document or document.status == DELETED_DOCUMENT_STATUS:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
     jobs = db.execute(select(Job).where(Job.document_id == document_id).order_by(desc(Job.created_at))).scalars().all()
     sample_chunks = (
@@ -527,8 +575,8 @@ def document_review(document_id: str, _: AdminUser, db: Session = Depends(get_se
     image_assets.sort(key=lambda a: a.page_number)
 
     return DocumentReview(
-        document=DocumentOut.model_validate(document),
-        jobs=[JobOut.model_validate(job) for job in jobs],
+        document=_document_out(document),
+        jobs=[_job_out(job) for job in jobs],
         stats={
             **(document.parse_stats or {}),
             "total_chunks": len(chunks),
@@ -599,7 +647,7 @@ def approve_document(
 ) -> dict:
     with sqlite_write_lock:
         document = db.get(Document, document_id)
-        if not document:
+        if not document or document.status == DELETED_DOCUMENT_STATUS:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
         if document.status not in {"parsed", "approved"}:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文档尚未完成解析")
@@ -611,7 +659,7 @@ def approve_document(
                 detail={
                     "code": "job_already_running",
                     "message": "该文档已有入库任务正在处理中，请稍后刷新查看结果。",
-                    "job": JobOut.model_validate(active_job).model_dump(mode="json"),
+                    "job": _job_out(active_job).model_dump(mode="json"),
                 },
             )
 
@@ -627,7 +675,7 @@ def approve_document(
         job=job,
         enqueue_call=lambda: enqueue_index(background_tasks, document.id, job.id),
     )
-    return {"job": JobOut.model_validate(job)}
+    return {"job": _job_out(job)}
 
 
 @router.post("/documents/{document_id}/reparse")
@@ -640,7 +688,7 @@ def reparse_document(
     previous_status = None
     with sqlite_write_lock:
         document = db.get(Document, document_id)
-        if not document:
+        if not document or document.status == DELETED_DOCUMENT_STATUS:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
 
         active_job = _active_job(db, document_id=document.id, job_type="parse")
@@ -650,7 +698,7 @@ def reparse_document(
                 detail={
                     "code": "job_already_running",
                     "message": "该文档已有重新解析任务正在处理中，请稍后刷新查看结果。",
-                    "job": JobOut.model_validate(active_job).model_dump(mode="json") if active_job else None,
+                    "job": _job_out(active_job).model_dump(mode="json") if active_job else None,
                 },
             )
 
@@ -678,19 +726,22 @@ def reparse_document(
             db.commit()
         raise exc
 
-    return {"job": JobOut.model_validate(job)}
+    return {"job": _job_out(job)}
 
 
 @router.delete("/documents/{document_id}")
 def delete_document(document_id: str, _: AdminUser, db: Session = Depends(get_session)) -> dict[str, bool]:
     with sqlite_write_lock:
         document = db.get(Document, document_id)
-        if not document:
+        if not document or document.status == DELETED_DOCUMENT_STATUS:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
-        active_jobs = _active_jobs(db, document_id=document_id, job_types=("parse", "index"))
-        if active_jobs:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="文档正在处理中，请稍后删除")
-        db.delete(document)
+        document.status = DELETED_DOCUMENT_STATUS
+        document.error_message = None
+        document.parse_stats = {}
+        document.updated_at = datetime.utcnow()
+        db.execute(delete(Job).where(Job.document_id == document_id))
+        db.execute(delete(Chunk).where(Chunk.document_id == document_id))
+        db.execute(delete(Asset).where(Asset.document_id == document_id))
         db.commit()
     VectorStore().delete_document(document_id)
     remove_document_storage(document_id)
@@ -702,7 +753,7 @@ def get_job(job_id: str, _: AdminUser, db: Session = Depends(get_session)) -> Jo
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
-    return JobOut.model_validate(job)
+    return _job_out(job)
 
 
 @router.get("/assets/{asset_id}")
@@ -710,6 +761,8 @@ def get_asset(asset_id: str) -> FileResponse:
     with SessionLocal() as db:
         asset = db.get(Asset, asset_id)
         if not asset:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="资源不存在")
+        if not _document_exists(db, asset.document_id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="资源不存在")
         path = Path(asset.path)
         media_type = asset.mime_type
@@ -722,7 +775,7 @@ def get_asset(asset_id: str) -> FileResponse:
 def get_document_file(document_id: str) -> FileResponse:
     with SessionLocal() as db:
         document = db.get(Document, document_id)
-        if not document:
+        if not document or document.status == DELETED_DOCUMENT_STATUS:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
         path = Path(document.stored_path)
         filename = document.filename

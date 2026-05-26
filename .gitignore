@@ -13,6 +13,8 @@ backend/storage/
 .env
 
 .venv-win/
+backend/.venv-win/
 .codex-run/
 
 .venv-ocr/
+backend/.venv-ocr/

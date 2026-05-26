@@ -195,6 +195,18 @@ function latestJobForDocument(jobs: JobOut[], documentId: string, jobType: strin
   return jobs.find((job) => job.document_id === documentId && job.job_type === jobType) || null;
 }
 
+function jobTypeLabel(jobType: string): string {
+  const labels: Record<string, string> = {
+    parse: "解析任务",
+    index: "入库任务",
+  };
+  return labels[jobType] || jobType;
+}
+
+function jobDocumentLabel(job: JobOut): string {
+  return job.document_filename?.trim() || "未关联文档任务";
+}
+
 function friendlyTaskError(message?: string | null): string | null {
   if (!message) return null;
   if (message.includes("DuplicatePreparedStatement")) {
@@ -1385,10 +1397,10 @@ function JobsPanelModal({ jobs, onClose }: { jobs: JobOut[]; onClose: () => void
         {jobs.slice(0, 16).map((job) => (
           <article key={job.id} className="job-card">
             <div className="job-head">
-              <strong>{job.document_id ? `文档任务 · ${job.job_type}` : job.job_type}</strong>
+              <strong>{jobDocumentLabel(job)}</strong>
               <span className={`status-chip ${job.status}`}>{statusLabel(job.status)}</span>
             </div>
-            <p>{job.message || "等待处理"}</p>
+            <p>{`${jobTypeLabel(job.job_type)} · ${job.message || "等待处理"}`}</p>
             <div className="progress-track">
               <span className="progress-fill" style={{ width: `${Math.max(4, job.progress)}%` }} />
             </div>

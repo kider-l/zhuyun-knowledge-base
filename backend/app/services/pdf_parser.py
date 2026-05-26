@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 import re
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.models import Asset, Chunk, Document, Job
@@ -15,6 +15,17 @@ from app.services.ocr import get_ocr_service
 from app.services.region_crop import compose_bbox, crop_normalized_bbox
 from app.services.storage import asset_dir
 from app.services.vision_summary import get_vision_summary_service
+
+DELETED_DOCUMENT_STATUS = "deleted"
+
+
+class DocumentDeletedError(RuntimeError):
+    pass
+
+
+def _document_deleted(db: Session, document_id: str) -> bool:
+    status_value = db.execute(select(Document.status).where(Document.id == document_id).limit(1)).scalar_one_or_none()
+    return status_value is None or status_value == DELETED_DOCUMENT_STATUS
 
 
 def _update_job(db: Session, job: Job | None, progress: int, message: str) -> None:
@@ -303,6 +314,9 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("PyMuPDF is required to parse PDF files") from exc
 
+    if _document_deleted(db, document.id):
+        raise DocumentDeletedError(document.id)
+
     document.status = "parsing"
     document.error_message = None
     document.updated_at = datetime.utcnow()
@@ -314,6 +328,9 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
     db.commit()
 
     _clear_previous_parse(db, document)
+
+    if _document_deleted(db, document.id):
+        raise DocumentDeletedError(document.id)
 
     pdf_path = Path(document.stored_path)
     assets_path = asset_dir(document.id)
@@ -355,6 +372,8 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
         document.page_count = pdf.page_count
         stats["pages"] = pdf.page_count
         for page_index in range(pdf.page_count):
+            if _document_deleted(db, document.id):
+                raise DocumentDeletedError(document.id)
             page = pdf.load_page(page_index)
             page_number = page_index + 1
             page_text = normalize_text(page.get_text("text") or "")
@@ -851,10 +870,14 @@ def parse_pdf(db: Session, document: Document, job: Job | None = None) -> dict:
                 stats["figure_region_diagnostics"].append(page_figure_diagnostics)
 
             if page_index % 3 == 0 or page_index == pdf.page_count - 1:
+                if _document_deleted(db, document.id):
+                    raise DocumentDeletedError(document.id)
                 db.commit()
                 progress = 5 + int((page_index + 1) / max(pdf.page_count, 1) * 85)
                 _update_job(db, job, progress, f"Parsed page {page_number}/{pdf.page_count}")
 
+    if _document_deleted(db, document.id):
+        raise DocumentDeletedError(document.id)
     document.status = "parsed"
     document.parse_stats = stats
     document.updated_at = datetime.utcnow()

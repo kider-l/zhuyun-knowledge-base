@@ -16,6 +16,7 @@ export interface DocumentOut {
 export interface JobOut {
   id: string;
   document_id?: string | null;
+  document_filename?: string | null;
   job_type: string;
   status: string;
   progress: number;

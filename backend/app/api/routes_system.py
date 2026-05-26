@@ -14,13 +14,14 @@ from app.services.scheduler import enqueue_index
 from app.services.vector_store import VectorStore
 
 router = APIRouter(prefix="/api", tags=["system"])
+DELETED_DOCUMENT_STATUS = "deleted"
 
 
 def _indexable_documents(db: Session) -> list[Document]:
     return (
         db.execute(
             select(Document)
-            .where(Document.status.in_(["parsed", "approved"]))
+            .where(Document.status.in_(["parsed", "approved"]), Document.status != DELETED_DOCUMENT_STATUS)
             .order_by(Document.updated_at.desc())
         )
         .scalars()
@@ -36,7 +37,7 @@ def system_status(_: AdminUser, db: Session = Depends(get_session)) -> dict:
     latest_document_stats = (
         db.execute(
             select(Document.parse_stats)
-            .where(Document.parse_stats.is_not(None))
+            .where(Document.parse_stats.is_not(None), Document.status != DELETED_DOCUMENT_STATUS)
             .order_by(Document.updated_at.desc())
         )
         .scalars()
@@ -50,10 +51,16 @@ def system_status(_: AdminUser, db: Session = Depends(get_session)) -> dict:
         if isinstance(warning, dict) and isinstance(warning.get("ocr"), dict):
             latest_ocr_warning = warning["ocr"]
             break
-    total_documents = db.scalar(select(func.count(Document.id))) or 0
-    approved_documents = db.scalar(select(func.count(Document.id)).where(Document.status == "approved")) or 0
-    parsed_documents = db.scalar(select(func.count(Document.id)).where(Document.status == "parsed")) or 0
-    failed_documents = db.scalar(select(func.count(Document.id)).where(Document.status == "failed")) or 0
+    total_documents = db.scalar(select(func.count(Document.id)).where(Document.status != DELETED_DOCUMENT_STATUS)) or 0
+    approved_documents = (
+        db.scalar(select(func.count(Document.id)).where(Document.status == "approved", Document.status != DELETED_DOCUMENT_STATUS)) or 0
+    )
+    parsed_documents = (
+        db.scalar(select(func.count(Document.id)).where(Document.status == "parsed", Document.status != DELETED_DOCUMENT_STATUS)) or 0
+    )
+    failed_documents = (
+        db.scalar(select(func.count(Document.id)).where(Document.status == "failed", Document.status != DELETED_DOCUMENT_STATUS)) or 0
+    )
     total_chunks = db.scalar(select(func.count(Chunk.id))) or 0
     embedded_chunks = db.scalar(select(func.count(Chunk.id)).where(Chunk.embedding.is_not(None))) or 0
     text_chunks = db.scalar(select(func.count(Chunk.id)).where(Chunk.kind == "text")) or 0

@@ -44,6 +44,7 @@ class JobOut(UTCModel):
 
     id: str
     document_id: str | None
+    document_filename: str | None = None
     job_type: str
     status: str
     progress: int

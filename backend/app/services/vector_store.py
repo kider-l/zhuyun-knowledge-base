@@ -21,6 +21,7 @@ from app.services.embeddings import get_embedding_service
 TEXT_COLLECTION = "text_chunks"
 IMAGE_COLLECTION = "image_chunks"
 IMAGE_TEXT_COLLECTION = "image_text_chunks"
+DELETED_DOCUMENT_STATUS = "deleted"
 
 IMAGE_INTENT_TERMS = ["图", "图纸", "疏散", "路线", "平面", "示意", "地图", "现场", "出口", "区域", "线路", "配电", "接线", "电路", "电气", "物资", "存放点"]
 
@@ -154,6 +155,11 @@ def _bbox_to_rect(bbox: dict | None) -> fitz.Rect | None:
 
 def _compact_text(value: str) -> str:
     return re.sub(r"\s+", "", value).lower()
+
+
+def _document_deleted(db: Session, document_id: str) -> bool:
+    status_value = db.execute(select(Document.status).where(Document.id == document_id).limit(1)).scalar_one_or_none()
+    return status_value is None or status_value == DELETED_DOCUMENT_STATUS
 
 
 def _content_terms(*values: str) -> list[str]:
@@ -431,6 +437,8 @@ class VectorStore:
             return 0
         indexed = 0
         for chunk in chunk_list:
+            if _document_deleted(db, chunk.document_id):
+                return indexed
             asset = db.get(Asset, chunk.asset_id) if chunk.kind == "image" and chunk.asset_id else None
             secondary_vector: list[float] | None = None
             secondary_model_name: str | None = None

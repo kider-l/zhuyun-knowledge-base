@@ -14,13 +14,20 @@ from app.config import get_settings
 from app.services.vector_store import VectorStore
 
 router = APIRouter(prefix="/api", tags=["search"])
+DELETED_DOCUMENT_STATUS = "deleted"
 
 
 def search_diagnostics(db: Session, extra: dict | None = None) -> dict:
-    total_docs = db.scalar(select(func.count(Document.id))) or 0
-    approved_docs = db.scalar(select(func.count(Document.id)).where(Document.status == "approved")) or 0
-    parsed_docs = db.scalar(select(func.count(Document.id)).where(Document.status == "parsed")) or 0
-    failed_docs = db.scalar(select(func.count(Document.id)).where(Document.status == "failed")) or 0
+    total_docs = db.scalar(select(func.count(Document.id)).where(Document.status != DELETED_DOCUMENT_STATUS)) or 0
+    approved_docs = (
+        db.scalar(select(func.count(Document.id)).where(Document.status == "approved", Document.status != DELETED_DOCUMENT_STATUS)) or 0
+    )
+    parsed_docs = (
+        db.scalar(select(func.count(Document.id)).where(Document.status == "parsed", Document.status != DELETED_DOCUMENT_STATUS)) or 0
+    )
+    failed_docs = (
+        db.scalar(select(func.count(Document.id)).where(Document.status == "failed", Document.status != DELETED_DOCUMENT_STATUS)) or 0
+    )
     approved_chunks = (
         db.scalar(
             select(func.count(Chunk.id))
