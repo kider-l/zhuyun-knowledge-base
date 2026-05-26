@@ -1,9 +1,10 @@
+import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -72,12 +73,18 @@ class Settings(BaseSettings):
     cloud_ocr_max_pages: int = 5
     ocr_lang: str = "chi_sim+eng"
     max_upload_mb: int = 2048
-    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"])
+    cors_origins: Annotated[
+        list[str],
+        NoDecode,
+    ] = Field(default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"])
 
     @field_validator("cors_origins", mode="before")
     @classmethod
     def parse_cors_origins(cls, value: str | list[str]) -> list[str]:
         if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("["):
+                return [str(item).strip() for item in json.loads(stripped) if str(item).strip()]
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
 
