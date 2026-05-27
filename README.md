@@ -49,34 +49,66 @@ docker compose up --build
 
 默认管理员账号见 `.env.example`，上线前必须修改。
 
-## 轻量模式开发
-
-如果只是本机快速改页面或调接口，也可以继续用轻量模式：
-
-- 把 `DATABASE_URL` 改回 SQLite
-- 关闭 `USE_RQ`
-- 清空 `QDRANT_URL`
-- 保留现有云模型和云 OCR，或进一步关闭 OCR
-
-然后分别启动前后端本机服务。
-
 ## 本机开发
+
+本机开发默认使用统一启动入口。它会自动：
+
+- 检查 Docker Desktop
+- 自动拉起 `Redis` 与 `Qdrant`
+- 启动本机 `RQ worker`
+- 启动本机 `API`
+- 启动本机 `Frontend`
+
+启动命令：
+
+```powershell
+.\dev-up.ps1
+```
+
+或：
+
+```bash
+make dev-up
+```
+
+停止本机服务：
+
+```powershell
+.\dev-down.ps1
+```
+
+如果还要顺手停止 `Redis` 和 `Qdrant` 容器：
+
+```powershell
+.\dev-down.ps1 -StopDependencies
+```
+
+本机开发会显式叠加 `.env.dev`，默认使用：
+
+- `DATABASE_URL=sqlite:///./data/app.db`
+- `REDIS_URL=redis://localhost:6379/0`
+- `QDRANT_URL=http://localhost:6333`
+- `USE_RQ=true`
+- `STORAGE_DIR=./storage`
+
+因此后台状态页默认应看到：
+
+- `Qdrant` 已启用
+- `RQ / Redis` 已启用
+
+文档解析、入库和重建索引任务会进入真实队列，不再退回进程内任务。
+
+如仍需分别单独启动前后端，可以继续使用原有命令，但这不再是推荐默认方式：
 
 ```bash
 cd backend
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
 ```bash
 cd frontend
-npm install
 npm run dev
 ```
-
-本机开发默认使用 `backend/data/app.db` 与 `backend/storage`，即使没有 Docker/Qdrant/Ollama，也可以完成上传、解析、审核、检索和问答兜底流程。
 
 ## OCR
 
