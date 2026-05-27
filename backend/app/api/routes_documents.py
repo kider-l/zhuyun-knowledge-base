@@ -25,6 +25,7 @@ from app.schemas import (
 )
 from app.services.scheduler import SchedulerEnqueueError, enqueue_index, enqueue_parse
 from app.services.storage import import_local_file, probe_file, probe_upload_stream, remove_document_storage, save_upload
+from app.services.task_queue import reconcile_pending_jobs
 from app.services.vector_store import VectorStore
 
 router = APIRouter(prefix="/api", tags=["documents"])
@@ -485,6 +486,7 @@ def list_documents(_: AdminUser, db: Session = Depends(get_session)) -> list[Doc
 
 @router.get("/jobs", response_model=list[JobOut])
 def list_jobs(_: AdminUser, db: Session = Depends(get_session)) -> list[JobOut]:
+    reconcile_pending_jobs(db)
     jobs = (
         db.execute(
             select(Job)
@@ -526,6 +528,7 @@ def list_upload_logs(_: AdminUser, db: Session = Depends(get_session)) -> list[U
 
 @router.get("/documents/{document_id}/review", response_model=DocumentReview)
 def document_review(document_id: str, _: AdminUser, db: Session = Depends(get_session)) -> DocumentReview:
+    reconcile_pending_jobs(db, document_id=document_id)
     document = db.get(Document, document_id)
     if not document or document.status == DELETED_DOCUMENT_STATUS:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
@@ -646,6 +649,7 @@ def approve_document(
     db: Session = Depends(get_session),
 ) -> dict:
     with sqlite_write_lock:
+        reconcile_pending_jobs(db, document_id=document_id)
         document = db.get(Document, document_id)
         if not document or document.status == DELETED_DOCUMENT_STATUS:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
@@ -687,6 +691,7 @@ def reparse_document(
 ) -> dict:
     previous_status = None
     with sqlite_write_lock:
+        reconcile_pending_jobs(db, document_id=document_id)
         document = db.get(Document, document_id)
         if not document or document.status == DELETED_DOCUMENT_STATUS:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
@@ -750,6 +755,7 @@ def delete_document(document_id: str, _: AdminUser, db: Session = Depends(get_se
 
 @router.get("/jobs/{job_id}", response_model=JobOut)
 def get_job(job_id: str, _: AdminUser, db: Session = Depends(get_session)) -> JobOut:
+    reconcile_pending_jobs(db)
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")

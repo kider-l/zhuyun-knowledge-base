@@ -215,6 +215,23 @@ function friendlyTaskError(message?: string | null): string | null {
   return message;
 }
 
+function jobLikelyStalled(job?: JobOut | null, thresholdSeconds = 180): boolean {
+  if (!job || !jobInProgress(job)) return false;
+  const updatedAt = Date.parse(job.updated_at);
+  if (Number.isNaN(updatedAt)) return false;
+  return Date.now() - updatedAt > thresholdSeconds * 1000;
+}
+
+function jobStatusDetail(job?: JobOut | null): string | null {
+  if (!job) return null;
+  const taskError = friendlyTaskError(job.error_message);
+  if (taskError) return taskError;
+  if (jobLikelyStalled(job)) {
+    return "任务长时间停留在等待状态，通常表示队列未被有效消费。请检查是否同时运行了本机开发模式和容器模式。";
+  }
+  return null;
+}
+
 function itemKindLabel(result: { kind: string; metadata: Record<string, unknown> }): string {
   if (result.metadata.asset_kind === "table") return "表格";
   if (result.metadata.asset_kind === "figure_region") return "切图区域";
@@ -1394,21 +1411,25 @@ function JobsPanelModal({ jobs, onClose }: { jobs: JobOut[]; onClose: () => void
   return (
     <ModalFrame title="处理进度" subtitle="上传、解析、入库进度都在这里查看。" onClose={onClose}>
       <div className="job-list">
-        {jobs.slice(0, 16).map((job) => (
-          <article key={job.id} className="job-card">
-            <div className="job-head">
-              <strong>{jobDocumentLabel(job)}</strong>
-              <span className={`status-chip ${job.status}`}>{statusLabel(job.status)}</span>
-            </div>
-            <p>{`${jobTypeLabel(job.job_type)} · ${job.message || "等待处理"}`}</p>
-            <div className="progress-track">
-              <span className="progress-fill" style={{ width: `${Math.max(4, job.progress)}%` }} />
-            </div>
-            <small>
-              {job.progress}% · {formatTime(job.updated_at)}
-            </small>
-          </article>
-        ))}
+        {jobs.slice(0, 16).map((job) => {
+          const detail = jobStatusDetail(job);
+          return (
+            <article key={job.id} className="job-card">
+              <div className="job-head">
+                <strong>{jobDocumentLabel(job)}</strong>
+                <span className={`status-chip ${job.status}`}>{statusLabel(job.status)}</span>
+              </div>
+              <p>{`${jobTypeLabel(job.job_type)} · ${job.message || "等待处理"}`}</p>
+              <div className="progress-track">
+                <span className="progress-fill" style={{ width: `${Math.max(4, job.progress)}%` }} />
+              </div>
+              <small>
+                {job.progress}% · {formatTime(job.updated_at)}
+              </small>
+              {detail && <small className="task-error-text">{detail}</small>}
+            </article>
+          );
+        })}
         {!jobs.length && <div className="empty">还没有处理任务。</div>}
       </div>
     </ModalFrame>
@@ -1549,6 +1570,7 @@ function ReviewDrawer({
       .filter((chunk) => (kind === "all" ? true : chunk.kind === kind));
   }, [review, page, kind]);
   const indexBusy = jobInProgress(activeIndexJob);
+  const indexJobDetail = jobStatusDetail(activeIndexJob);
 
   async function removeChunk(chunk: ChunkOut) {
     if (busyChunkId === chunk.id) return;
@@ -1595,7 +1617,7 @@ function ReviewDrawer({
             </button>
           </div>
         </div>
-        {indexBusy && <div className="notice">该文档已有入库任务正在处理中，请等待当前任务完成。</div>}
+        {indexBusy && <div className="notice">{indexJobDetail || "该文档已有入库任务正在处理中，请等待当前任务完成。"}</div>}
 
         <div className="preview-strip">
           {review.page_assets.map((asset) => (
@@ -2099,6 +2121,11 @@ function AdminSite({ section }: { section: AdminSection }) {
           )}
 
           {message && <div className="notice">{message}</div>}
+          {section === "status" && systemStatus?.services.rq_conflict && (
+            <div className="notice warning">
+              检测到另一种运行模式的任务 worker 仍在连接同一套 Redis。当前系统已切换为互斥模式，请先停止另一种模式后再继续入库。
+            </div>
+          )}
           {section === "status" &&
             systemStatus &&
             (!systemStatus.services.use_rq ||

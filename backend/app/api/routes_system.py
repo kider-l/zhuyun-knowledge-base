@@ -11,6 +11,7 @@ from app.services.embeddings import get_embedding_service
 from app.services.ocr import get_ocr_service
 from app.services.reranker import get_reranker_health
 from app.services.scheduler import enqueue_index
+from app.services.task_queue import describe_conflicting_workers, reconcile_pending_jobs
 from app.services.vector_store import VectorStore
 
 router = APIRouter(prefix="/api", tags=["system"])
@@ -32,8 +33,10 @@ def _indexable_documents(db: Session) -> list[Document]:
 @router.get("/system/status")
 def system_status(_: AdminUser, db: Session = Depends(get_session)) -> dict:
     settings = get_settings()
+    reconcile_pending_jobs(db)
     embedding_service = get_embedding_service()
     reranker = get_reranker_health()
+    conflicting_workers = describe_conflicting_workers(settings)
     latest_document_stats = (
         db.execute(
             select(Document.parse_stats)
@@ -124,7 +127,19 @@ def system_status(_: AdminUser, db: Session = Depends(get_session)) -> dict:
         "services": {
             "qdrant_available": VectorStore().available,
             "use_rq": settings.use_rq,
+            "rq_queue_name": settings.rq_queue_name,
+            "rq_runtime_mode": settings.rq_runtime_mode,
             "running_jobs": running_jobs,
+            "rq_conflict": bool(conflicting_workers),
+            "rq_conflict_workers": [
+                {
+                    "name": worker.name,
+                    "hostname": worker.hostname,
+                    "pid": worker.pid,
+                    "queues": worker.queue_names,
+                }
+                for worker in conflicting_workers
+            ],
             "ocr_enabled": ocr_diag["enabled"],
             "ocr_backend": ocr_diag["backend"],
             "ocr_paddle_enabled": ocr_diag["paddle_enabled"],
@@ -171,6 +186,7 @@ def rebuild_index(
     _: AdminUser,
     db: Session = Depends(get_session),
 ) -> dict[str, list[JobOut]]:
+    reconcile_pending_jobs(db)
     jobs: list[Job] = []
     for document in _indexable_documents(db):
         job = Job(document_id=document.id, job_type="index", status="queued", progress=0, message="等待重建向量索引")

@@ -41,6 +41,8 @@ services:
       REDIS_URL: redis://redis:6379/0
       QDRANT_URL: http://qdrant:6333
       USE_RQ: "true"
+      RQ_QUEUE_NAME: default_docker
+      RQ_RUNTIME_MODE: docker
       STORAGE_DIR: /data/storage
     depends_on:
       postgres:
@@ -71,6 +73,8 @@ services:
       REDIS_URL: redis://redis:6379/0
       QDRANT_URL: http://qdrant:6333
       USE_RQ: "true"
+      RQ_QUEUE_NAME: default_docker
+      RQ_RUNTIME_MODE: docker
       STORAGE_DIR: /data/storage
     depends_on:
       postgres:

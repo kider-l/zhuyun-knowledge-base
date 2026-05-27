@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=(PROJECT_ROOT / ".env", BACKEND_ROOT / ".env"),
+        env_file=(PROJECT_ROOT / ".env", PROJECT_ROOT / ".env.dev", BACKEND_ROOT / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     qdrant_url: str | None = None
     use_rq: bool = False
+    rq_queue_name: str = "default"
+    rq_runtime_mode: Literal["local", "docker", "unknown"] = "unknown"
+    rq_job_timeout_seconds: int = 60 * 60 * 6
+    rq_stalled_job_seconds: int = 180
     storage_dir: Path = Path("./storage")
 
     model_provider: Literal["ollama", "openai_compatible", "none"] = "ollama"

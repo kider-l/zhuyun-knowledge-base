@@ -220,6 +220,61 @@ function Ensure-ComposeService {
     }
 }
 
+function Assert-NoRunningComposeMode {
+    $runningServices = & docker compose -f $composeFile ps --services --filter "status=running"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to inspect docker compose service status."
+    }
+
+    $conflicts = @($runningServices | Where-Object { $_ -in @("api", "worker", "frontend", "frontend-dev") })
+    if ($conflicts.Count -gt 0) {
+        $joined = ($conflicts -join ", ")
+        throw "Docker compose mode is already running ($joined). Stop the container stack before starting local development mode."
+    }
+}
+
+function Assert-NoConflictingRqWorkers {
+    param(
+        [string]$RedisUrl,
+        [string]$ConflictQueueName
+    )
+
+    $pythonCode = @"
+from datetime import datetime, timedelta
+from redis import Redis
+from rq import Worker
+import sys
+
+redis_url = sys.argv[1]
+conflict_queue = sys.argv[2]
+r = Redis.from_url(redis_url)
+cutoff = datetime.utcnow() - timedelta(seconds=90)
+conflicts = []
+for worker in Worker.all(connection=r):
+    heartbeat = worker.last_heartbeat
+    if heartbeat is None:
+        continue
+    heartbeat = heartbeat.replace(tzinfo=None)
+    if heartbeat < cutoff:
+        continue
+    queue_names = [queue.name for queue in worker.queues]
+    if conflict_queue in queue_names:
+        conflicts.append(f"{worker.hostname} pid={worker.pid} queues={','.join(queue_names)}")
+
+if conflicts:
+    print("; ".join(conflicts))
+    raise SystemExit(2)
+"@
+
+    $output = & $pythonExe -c $pythonCode $RedisUrl $ConflictQueueName
+    if ($LASTEXITCODE -eq 2) {
+        throw "Detected active docker-mode workers on queue '$ConflictQueueName'. Stop docker compose mode first. Conflicts: $output"
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to inspect Redis worker registrations."
+    }
+}
+
 Assert-Exists -Path $pythonExe -Label "Python virtualenv"
 Assert-Exists -Path $viteCmd -Label "Vite executable"
 Assert-Exists -Path $composeFile -Label "docker-compose file"
@@ -228,8 +283,12 @@ Apply-EnvironmentFiles -Paths @(
     (Join-Path $projectRoot ".env"),
     (Join-Path $projectRoot ".env.dev")
 )
+[Environment]::SetEnvironmentVariable("USE_RQ", "true", "Process")
+[Environment]::SetEnvironmentVariable("RQ_QUEUE_NAME", "default_local", "Process")
+[Environment]::SetEnvironmentVariable("RQ_RUNTIME_MODE", "local", "Process")
 
 Ensure-DockerDesktop
+Assert-NoRunningComposeMode
 
 Ensure-ComposeService -ServiceName "redis" `
     -HealthCheck { Test-RedisReady -PythonPath $pythonExe -TimeoutSeconds 30 } `
@@ -238,6 +297,8 @@ Ensure-ComposeService -ServiceName "redis" `
 Ensure-ComposeService -ServiceName "qdrant" `
     -HealthCheck { Test-HttpReady -Url "http://localhost:6333/collections" -TimeoutSeconds 30 } `
     -FailureMessage "Qdrant is still unavailable after startup."
+
+Assert-NoConflictingRqWorkers -RedisUrl $env:REDIS_URL -ConflictQueueName "default_docker"
 
 $workerProcess = Get-WorkerProcess
 if ($workerProcess) {

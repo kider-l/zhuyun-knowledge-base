@@ -176,7 +176,16 @@ export interface SystemStatus {
   services: {
     qdrant_available: boolean;
     use_rq: boolean;
+    rq_queue_name?: string;
+    rq_runtime_mode?: string;
     running_jobs: number;
+    rq_conflict?: boolean;
+    rq_conflict_workers?: Array<{
+      name: string;
+      hostname: string;
+      pid?: number | null;
+      queues: string[];
+    }>;
     ocr_enabled: boolean;
     ocr_backend: string;
     ocr_paddle_enabled?: boolean;
