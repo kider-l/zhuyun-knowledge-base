@@ -295,7 +295,7 @@ function displayableResults(response: AnswerResponse): Array<{ result: SearchRes
   }
 
   const seen = new Set<string>();
-  const seenOverlapPage = new Set<string>();
+  const seenPage = new Set<string>();
   // 去重前把被引用的排前面，确保被引用的优先保留
   const merged = allResults
     .slice()
@@ -310,10 +310,14 @@ function displayableResults(response: AnswerResponse): Array<{ result: SearchRes
     seen.add(key);
     const meta = item.result.metadata as Record<string, unknown>;
     const assetKind = String(meta?.asset_kind || "");
-    if (["figure", "figure_region", "whole_figure_fallback"].includes(assetKind)) {
-      const pageKey = `${item.result.document_id}:${item.result.page_number}`;
-      if (seenOverlapPage.has(pageKey)) return false;
-      seenOverlapPage.add(pageKey);
+    const pageKey = `${item.result.document_id}:${item.result.page_number}`;
+    // 全页截图（page/whole_figure_fallback）：如果该页已有精确切图，跳过避免重复
+    if (["page", "whole_figure_fallback"].includes(assetKind) && seenPage.has(pageKey)) {
+      return false;
+    }
+    // 精确切图：记录该页已有精细内容，后续全页截图不再重复展示
+    if (["figure_region", "embedded_image", "figure", "table", "page", "whole_figure_fallback"].includes(assetKind)) {
+      seenPage.add(pageKey);
     }
     return true;
   });
@@ -327,7 +331,7 @@ function displayableResults(response: AnswerResponse): Array<{ result: SearchRes
       if (bCited) return 1;
       return a.index - b.index;
     })
-    .slice(0, 12)
+    .slice(0, 10)
     .map((item) => ({ ...item, cited: citedSet.has(item.index) }));
 }
 
@@ -806,67 +810,27 @@ function InlineEvidenceGallery({
 }) {
   if (!items.length) return null;
 
-  // 最高分为参照；得分低于此比例的被归入引用区
-  const maxScore = Math.max(...items.map(i => i.result.score), 0.01);
-  const SCORE_RATIO_FLOOR = 0.35;
-
-  // 强相关图片（被 LLM 引用 + 非弱内容 + 得分未显著落后）
-  // 弱相关图片 = 其余全部归入"引用图片资料"区
-  const strongItems = items.filter((item) => {
-    if (!item.cited) return false;
-    if (isWeakImage(item)) return false;
-    if (item.result.score < maxScore * SCORE_RATIO_FLOOR) return false;
-    return true;
-  });
-  const refItems = items.filter((item) => {
-    return !item.cited || isWeakImage(item) || item.result.score < maxScore * SCORE_RATIO_FLOOR;
-  });
-
+  // 统一展示所有图片，去掉“引用图片资料”分组标签
   return (
     <section className="inline-evidence-gallery">
-      {strongItems.length > 0 && (
-        <div className="inline-evidence-strip">
-          {strongItems.map((item, thumbIndex) => {
-            const imageUrl = assetUrl(item.result.asset_url);
-            if (!imageUrl) return null;
-            return (
-              <button
-                type="button"
-                key={`${item.result.chunk_id}-${item.index}`}
-                className="inline-evidence-thumb"
-                onClick={() => onOpen(items.indexOf(item))}
-              >
-                <div className="inline-evidence-image-wrap">
-                  <img src={imageUrl} alt={`${item.result.document_name} 第 ${item.result.page_number} 页`} onError={(e) => { (e.currentTarget.closest('button') as HTMLElement)?.style.setProperty('display', 'none'); }} />
-                </div>
-              </button>
-            );
-          })}
-        </div>
-      )}
-      {refItems.length > 0 && (
-        <>
-          <div className="inline-evidence-group-label">引用图片资料</div>
-          <div className="inline-evidence-strip">
-            {refItems.map((item, thumbIndex) => {
-              const imageUrl = assetUrl(item.result.asset_url);
-              if (!imageUrl) return null;
-              return (
-                <button
-                  type="button"
-                  key={`${item.result.chunk_id}-${item.index}`}
-                  className="inline-evidence-thumb"
-                  onClick={() => onOpen(items.indexOf(item))}
-                >
-                  <div className="inline-evidence-image-wrap">
-                    <img src={imageUrl} alt={`${item.result.document_name} 第 ${item.result.page_number} 页`} onError={(e) => { (e.currentTarget.closest('button') as HTMLElement)?.style.setProperty('display', 'none'); }} />
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </>
-      )}
+      <div className="inline-evidence-strip">
+        {items.map((item, thumbIndex) => {
+          const imageUrl = assetUrl(item.result.asset_url);
+          if (!imageUrl) return null;
+          return (
+            <button
+              type="button"
+              key={`${item.result.chunk_id}-${item.index}`}
+              className="inline-evidence-thumb"
+              onClick={() => onOpen(items.indexOf(item))}
+            >
+              <div className="inline-evidence-image-wrap">
+                <img src={imageUrl} alt={`${item.result.document_name} 第 ${item.result.page_number} 页`} onError={(e) => { (e.currentTarget.closest("button") as HTMLElement)?.style.setProperty("display", "none"); }} />
+              </div>
+            </button>
+          );
+        })}
+      </div>
     </section>
   );
 }

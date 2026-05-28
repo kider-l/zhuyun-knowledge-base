@@ -961,18 +961,28 @@ class VectorStore:
                         best_per_page[key] = r
             else:
                 deduped.append(r)
-        # 图片意图查询：如果已有足够精准切图，去掉全页级截图避免干扰
+        # 关键修复：某页已有精确切图时，不再追加该页的全页截图，避免同一页内容重复展示
+        pages_with_precise = {
+            (r.document_id, r.page_number)
+            for r in deduped
+            if r.kind == "image" and str(r.metadata.get("asset_kind", "")) in PRECISE_CROP_TYPES
+        }
+        best_per_page = {k: v for k, v in best_per_page.items() if k not in pages_with_precise}
+
         if image_intent:
-            precise_count = sum(1 for r in deduped if str(r.metadata.get("asset_kind", "")) in PRECISE_CROP_TYPES)
+            precise_count = len(pages_with_precise)
             if precise_count >= 2:
                 best_per_page = {
                     k: v for k, v in best_per_page.items()
                     if v.metadata.get("image_class") != "SCENE_IMAGE"
                 }
-            deduped = deduped + sorted(best_per_page.values(), key=lambda r: r.score, reverse=True)
+            # 图片意图时最多补充4张全页截图，避免图片过多
+            extra_pages = sorted(best_per_page.values(), key=lambda r: r.score, reverse=True)[:4]
+            deduped = deduped + extra_pages
         else:
-            deduped = deduped + sorted(best_per_page.values(), key=lambda r: r.score, reverse=True)
-        ranked_results = deduped
+            # 非图片意图时更严格，最多补充2张全页截图
+            extra_pages = sorted(best_per_page.values(), key=lambda r: r.score, reverse=True)[:2]
+            deduped = deduped + extra_pages
         image_result_type_breakdown: dict[str, int] = {}
         for result in ranked_results[:top_k]:
             asset_kind = str(result.metadata.get("asset_kind") or result.kind)
